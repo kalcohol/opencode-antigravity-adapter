@@ -429,11 +429,11 @@ export default Plugin.define({
 
 **当前仓库已经有一个独立插件实现**（根目录 `src/`，不改 OpenCode 源码）：
 
-- `src/acp/client.ts`：raw NDJSON ACP 客户端（initialize/new/resume/set_config_option/prompt/cancel/close、权限请求、32 MiB frame cap、process group cleanup）。
-- `src/session.ts`：每个 OpenCode session 一个 ACP session；`session/resume`；configOptions 模型/effort/mode；`ctx.permission.assert` 权限；取消时回滚 pending permission。
-- `src/language-model.ts`：LanguageModelV3 流映射；text/thought/tool/usage；tool-result 只在终态发一次；usage 按 net input 处理。
-- `src/index.ts`：provider 注册、aisdk hooks、context/model.request/title hooks、catalog 缓存 + fallback + 后台刷新、consumer auth gate。
-- 测试：`bun run test`（6 个单元测试）、`bun run test:integration`（mock ACP，端到端）、`ANTIGRAVITY_ACP_LIVE=1 bun test live.test.ts`（真实 handshake/config，无 prompt）。
+- `src/acp/client.ts`：raw NDJSON ACP 客户端（initialize/new/resume/set_config_option/prompt/cancel/close、权限请求、协议 v1 校验、32 MiB frame cap、process group cleanup、Windows taskkill、write 失败即失败、stderr 脱敏）。
+- `src/session.ts`：每个 OpenCode session 一个 ACP session；resume 保留原 ACP id/cwd；per-session turn lock；configOptions 模型/effort/mode；模型或 mode 切换失败会中止 turn；`plan` agent 映射 ACP `plan`；`ctx.permission.assert` 权限；取消时回滚 pending permission；start/dispose/close 生命周期处理。
+- `src/language-model.ts`：LanguageModelV3 流映射；只取最后一条 user turn；text/thought/tool/usage；tool-result 只在终态发一次，pending tool 在 finish 时补 incomplete；usage 按 net input 处理；title/compaction 本地处理、generate 拒绝；缺 session header 直接报错；图片 URL/非图片文件给出可见 text note。
+- `src/index.ts`：provider 注册、aisdk hooks、context/model.request/title/compaction/retry hooks、`antigravity.*` 强制 ask 的 permission hook、catalog 缓存 + fallback + 后台刷新、consumer auth gate、auto-discovery 的 `ANTIGRAVITY_ACP_ALLOW_CONSUMER`、ManagerRef 支持插件 reload、远程 workspace 跳过。
+- 测试：`bun run test`（10 个单元测试）、`bun run test:integration`（mock ACP，端到端）、`ANTIGRAVITY_ACP_LIVE=1 bun test live.test.ts`（真实 handshake/config，无 prompt）。
 
 接下来的路线：
 

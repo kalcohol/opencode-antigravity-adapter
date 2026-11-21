@@ -23,6 +23,10 @@ import type { RunRequest, SessionManager } from "./session.js"
 
 export const PROVIDER_ID = "antigravity-acp"
 
+export const COMPACTION_SUMMARY =
+  "Antigravity keeps its own ACP conversation history. This OpenCode provider sends only the " +
+  "current user turn; no cross-model transcript was replayed for compaction."
+
 export interface Dependencies {
   readonly run: (
     sessionID: string,
@@ -42,37 +46,31 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
     private readonly dependencies: Dependencies,
   ) {}
 
-  async doGenerate(options: LanguageModelV3CallOptions) {
-    const { stream } = await this.doStream(options)
-    const reader = stream.getReader()
-    const content: Array<{ type: "text" | "reasoning"; text: string }> = []
-    let text = ""
-    let reasoning = ""
-    let finishReason: LanguageModelV3FinishReason = { unified: "other", raw: undefined }
-    let usage = emptyUsage()
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (value.type === "text-delta") text += value.delta
-      else if (value.type === "reasoning-delta") reasoning += value.delta
-      else if (value.type === "finish") {
-        finishReason = value.finishReason
-        usage = value.usage
-      } else if (value.type === "error") {
-        throw value.error
-      }
-    }
-
-    if (reasoning) content.push({ type: "reasoning", text: reasoning })
-    if (text) content.push({ type: "text", text })
-    return { content, finishReason, usage, warnings: [] }
+  async doGenerate(): Promise<never> {
+    throw new Error("Antigravity models only support streaming")
   }
 
   async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
     const headers = options.headers ?? {}
-    const sessionID = String(headers["x-opencode-session-id"] ?? "__default__")
+    const sessionHeader = String(headers["x-opencode-session-id"] ?? "")
     const variant = String(headers["x-opencode-variant"] ?? "") || undefined
+    const kind = String(headers["x-opencode-request-kind"] ?? "primary")
+
+    // Auxiliary requests must not spend an ACP turn. The title/compaction
+    // hooks normally set a local result; these streams are fail-safes.
+    if (kind === "generate") {
+      throw new Error("Antigravity provider does not support stateless generate requests")
+    }
+    if (kind === "title") return { stream: localStream("Antigravity session") }
+    if (kind === "compaction") return { stream: localStream(COMPACTION_SUMMARY) }
+    if (!sessionHeader) {
+      throw new Error(
+        "Antigravity provider requires an OpenCode session ID. A stateless or header-less call " +
+          "cannot be mapped to an ACP session safely.",
+      )
+    }
+    const sessionID = sessionHeader
+
     const request: RunRequest = {
       model: this.modelId,
       variant,
@@ -88,7 +86,7 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
 
     const stream = new ReadableStream<LanguageModelV3StreamPart>({
       start: (controller) => {
-        const renderer = new Renderer(controller)
+        const renderer = new Renderer(controller, String(++streamSeq))
         controller.enqueue({ type: "stream-start", warnings: [] })
         task = this.dependencies
           .run(sessionID, request, (update) => {
@@ -116,15 +114,25 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
   }
 }
 
+let streamSeq = 0
+
 /** One stream's block/tool state. ACP updates are incremental; the AI SDK stream is too. */
 class Renderer {
   private textOpen = false
   private reasoningOpen = false
+  private readonly textID: string
+  private readonly reasoningID: string
   private readonly tools = new Map<string, { name: string }>()
   private readonly finished = new Set<string>()
   private contextUsage: { used: number; size: number } | undefined
 
-  constructor(private readonly controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>) {}
+  constructor(
+    private readonly controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+    runID: string,
+  ) {
+    this.textID = `text-${runID}`
+    this.reasoningID = `reasoning-${runID}`
+  }
 
   update(update: AcpSessionUpdate): void {
     if (update.sessionUpdate === "agent_message_chunk") {
@@ -132,10 +140,10 @@ class Renderer {
       if (!text) return
       this.closeReasoning()
       if (!this.textOpen) {
-        this.controller.enqueue({ type: "text-start", id: "text" })
+        this.controller.enqueue({ type: "text-start", id: this.textID })
         this.textOpen = true
       }
-      this.controller.enqueue({ type: "text-delta", id: "text", delta: text })
+      this.controller.enqueue({ type: "text-delta", id: this.textID, delta: text })
       return
     }
 
@@ -144,10 +152,10 @@ class Renderer {
       if (!text) return
       this.closeText()
       if (!this.reasoningOpen) {
-        this.controller.enqueue({ type: "reasoning-start", id: "reasoning" })
+        this.controller.enqueue({ type: "reasoning-start", id: this.reasoningID })
         this.reasoningOpen = true
       }
-      this.controller.enqueue({ type: "reasoning-delta", id: "reasoning", delta: text })
+      this.controller.enqueue({ type: "reasoning-delta", id: this.reasoningID, delta: text })
       return
     }
 
@@ -197,13 +205,28 @@ class Renderer {
     if (update.sessionUpdate === "usage_update") {
       const used = Number(update.used)
       const size = Number(update.size)
-      if (Number.isFinite(used) && Number.isFinite(size)) this.contextUsage = { used, size }
+      // A zero-valued setup update is not context occupancy; ignore it so it
+      // cannot overwrite a real value.
+      if (Number.isFinite(used) && Number.isFinite(size) && used > 0 && size > 0) {
+        this.contextUsage = { used, size }
+      }
     }
   }
 
   finish(result: AcpPromptResult): void {
     this.closeText()
     this.closeReasoning()
+    for (const [id, tool] of this.tools) {
+      if (this.finished.has(id)) continue
+      this.finished.add(id)
+      this.controller.enqueue({
+        type: "tool-result",
+        toolCallId: id,
+        toolName: tool.name,
+        result: { status: result.stopReason === "cancelled" ? "cancelled" : "incomplete" },
+        isError: true,
+      })
+    }
     this.controller.enqueue({
       type: "finish",
       finishReason: finishReason(result.stopReason ?? "unknown"),
@@ -213,36 +236,60 @@ class Renderer {
 
   private closeText(): void {
     if (!this.textOpen) return
-    this.controller.enqueue({ type: "text-end", id: "text" })
+    this.controller.enqueue({ type: "text-end", id: this.textID })
     this.textOpen = false
   }
 
   private closeReasoning(): void {
     if (!this.reasoningOpen) return
-    this.controller.enqueue({ type: "reasoning-end", id: "reasoning" })
+    this.controller.enqueue({ type: "reasoning-end", id: this.reasoningID })
     this.reasoningOpen = false
   }
 }
 
 /** Extract the current user turn. Antigravity owns conversation history in its ACP session. */
 export function promptToBlocks(prompt: LanguageModelV3Prompt): AcpContentBlock[] {
+  let lastUser = -1
   for (let index = prompt.length - 1; index >= 0; index -= 1) {
-    const message = prompt[index]
-    if (message.role !== "user") continue
-    const blocks: AcpContentBlock[] = []
-    for (const part of message.content) {
-      if (part.type === "text" && part.text.length > 0) {
-        blocks.push({ type: "text", text: part.text })
+    if (prompt[index].role === "user") {
+      lastUser = index
+      break
+    }
+  }
+  if (lastUser < 0) return [{ type: "text", text: "[continue]" }]
+
+  const message = prompt[lastUser]
+  if (message.role !== "user") return [{ type: "text", text: "[continue]" }]
+  const blocks: AcpContentBlock[] = []
+  for (const part of message.content) {
+    if (part.type === "text" && part.text.length > 0) {
+      blocks.push({ type: "text", text: part.text })
+      continue
+    }
+    if (part.type === "file") {
+      if (!part.mediaType.startsWith("image/")) {
+        blocks.push({
+          type: "text",
+          text: `[file omitted: ${part.filename ?? part.mediaType} is not an inline image]`,
+        })
         continue
       }
-      if (part.type === "file" && part.mediaType.startsWith("image/")) {
-        const data = imageData(part.data)
-        if (data) blocks.push({ type: "image", data, mimeType: part.mediaType })
+      const data = imageData(part.data)
+      if (data) {
+        blocks.push({ type: "image", data, mimeType: part.mediaType })
+      } else {
+        blocks.push({
+          type: "text",
+          text: "[image omitted: only inline base64/Uint8Array images are supported]",
+        })
       }
     }
-    if (blocks.length > 0) return blocks
   }
-  return [{ type: "text", text: "[continue]" }]
+  if (blocks.length === 0) return [{ type: "text", text: "[continue]" }]
+  if (blocks.some((block) => block.type === "image") && !blocks.some((block) => block.type === "text")) {
+    blocks.unshift({ type: "text", text: "See the attached image." })
+  }
+  return blocks
 }
 
 function contentText(content: unknown): string | undefined {
@@ -297,21 +344,20 @@ function toUsage(
   context: { used: number; size: number } | undefined,
 ): LanguageModelV3Usage {
   // Antigravity 1.5.x reports `inputTokens` as net input (cache reads/writes
-  // are separate) and `outputTokens` as inclusive of thoughts. Use
-  // `totalTokens` when it is present to avoid double-counting cache.
+  // are separate) and `outputTokens` as inclusive of thoughts. Do not derive
+  // input from `totalTokens`; the total's cumulative/per-turn meaning is
+  // ambiguous across ACP versions. Fall back to context occupancy only for
+  // the total, never for per-turn non-cached input.
   const netInput = reported?.inputTokens
   const output = reported?.outputTokens
   const cacheRead = reported?.cachedReadTokens
   const cacheWrite = reported?.cachedWriteTokens
   const reasoning = reported?.thoughtTokens
-  const total = reported?.totalTokens
   const totalInput =
-    total !== undefined && output !== undefined
-      ? Math.max(0, total - output)
-      : netInput !== undefined
-        ? netInput + (cacheRead ?? 0) + (cacheWrite ?? 0)
-        : context?.used
-  const noCache = netInput ?? context?.used
+    netInput !== undefined
+      ? netInput + (cacheRead ?? 0) + (cacheWrite ?? 0)
+      : context?.used
+  const noCache = netInput
   const text = output !== undefined ? Math.max(0, output - (reasoning ?? 0)) : undefined
   return {
     inputTokens: { total: totalInput, noCache, cacheRead, cacheWrite },
@@ -324,6 +370,23 @@ function emptyUsage(): LanguageModelV3Usage {
     inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
     outputTokens: { total: undefined, text: undefined, reasoning: undefined },
   }
+}
+
+function localStream(text: string): ReadableStream<LanguageModelV3StreamPart> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue({ type: "stream-start", warnings: [] })
+      controller.enqueue({ type: "text-start", id: "text" })
+      controller.enqueue({ type: "text-delta", id: "text", delta: text })
+      controller.enqueue({ type: "text-end", id: "text" })
+      controller.enqueue({
+        type: "finish",
+        finishReason: { unified: "stop", raw: "local" },
+        usage: emptyUsage(),
+      })
+      controller.close()
+    },
+  })
 }
 
 export function makeLanguageModel(manager: SessionManager, modelID: string) {

@@ -54,6 +54,7 @@ export interface RunRequest {
 
 interface StoredSession {
   readonly acpSessionId?: string
+  readonly cwd?: string
   readonly model?: string
   readonly effort?: string
   readonly mode?: string
@@ -68,8 +69,10 @@ interface SessionState {
   readonly sessionID: string
   proc: AcpProcess
   acpSessionId: string
+  cwd: string
   catalog: readonly AcpDiscoveredModel[]
   modes: readonly string[]
+  supportsImage: boolean
   model?: string
   effort?: string
   mode?: string
@@ -99,12 +102,19 @@ const isAuthError = (error: unknown) => {
 export class SessionManager {
   private readonly states = new Map<string, SessionState>()
   private readonly agents = new Map<string, string>()
+  private readonly starting = new Map<string, Promise<SessionState>>()
+  private fallbackCatalog: readonly AcpDiscoveredModel[] = []
   private disposed = false
 
   constructor(
     private readonly ctx: Context,
     private readonly options: Options,
   ) {}
+
+  /** Catalog used when a resume response omits models/variants. */
+  setCatalog(catalog: readonly AcpDiscoveredModel[]): void {
+    this.fallbackCatalog = catalog
+  }
 
   /** Remember the OpenCode agent for permission prompts on this session. */
   setAgent(sessionID: string, agent: string): void {
@@ -136,14 +146,26 @@ export class SessionManager {
     const state = await this.ensure(sessionID)
     if (state.active) throw new Error("Antigravity is already running a turn in this session")
 
-    await this.applyModel(state, request.model, request.variant)
-
-    state.cancelled = false
     const active: ActiveTurn = { onUpdate, cancelled: false }
     state.active = active
+    state.cancelled = false
 
     let cleanup = () => {}
     try {
+      await this.applyModel(state, request.model, request.variant)
+      await this.applyMode(state, state.agent === "plan" ? "plan" : this.options.mode, true)
+
+      const prompt = state.supportsImage
+        ? request.prompt
+        : request.prompt.map((block) =>
+            block.type === "image"
+              ? {
+                  type: "text" as const,
+                  text: "[image omitted: this ACP server does not advertise image prompt support]",
+                }
+              : block,
+          )
+
       return await new Promise<AcpPromptResult>((resolve, reject) => {
         let settled = false
         const settle = (fn: () => void) => {
@@ -165,9 +187,22 @@ export class SessionManager {
         }
         signal.addEventListener("abort", onAbort, { once: true })
         cleanup = () => signal.removeEventListener("abort", onAbort)
-        state.proc.prompt(state.acpSessionId, request.prompt).then(
+        state.proc.prompt(state.acpSessionId, prompt).then(
           (result) => settle(() => resolve(result)),
-          (error) => settle(() => reject(error instanceof Error ? error : new Error(String(error)))),
+          (error) => {
+            if ((error as { acpCode?: unknown })?.acpCode === -32002) {
+              void this.close(sessionID)
+              settle(() =>
+                reject(
+                  new Error(
+                    "Antigravity session expired; the turn was not retried. Send the message again to start a new ACP session.",
+                  ),
+                ),
+              )
+              return
+            }
+            settle(() => reject(error instanceof Error ? error : new Error(String(error))))
+          },
         )
       })
     } finally {
@@ -188,13 +223,16 @@ export class SessionManager {
 
   /** Close the ACP session and its process, and remove its persisted binding. */
   async close(sessionID: string): Promise<void> {
+    const pending = this.starting.get(sessionID)
+    if (pending) await pending.catch(() => undefined)
     const state = this.states.get(sessionID)
     if (!state) return
     this.states.delete(sessionID)
     this.agents.delete(sessionID)
     state.cancelled = true
     cancelPermissions(state)
-    await state.proc.closeSession(state.acpSessionId).catch(() => undefined)
+    // Best-effort: do not block a shared event stream for 5s.
+    void state.proc.closeSession(state.acpSessionId).catch(() => undefined)
     await state.proc.dispose()
     await Effect.runPromise(this.ctx.storage.remove(`${STORAGE_PREFIX}${sessionID}`)).catch(() => undefined)
   }
@@ -203,13 +241,16 @@ export class SessionManager {
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
+    await Promise.allSettled([...this.starting.values()])
     const states = [...this.states.values()]
     this.states.clear()
+    this.starting.clear()
+    this.agents.clear()
     await Promise.allSettled(
       states.map(async (state) => {
         state.cancelled = true
         cancelPermissions(state)
-        await state.proc.closeSession(state.acpSessionId).catch(() => undefined)
+        void state.proc.closeSession(state.acpSessionId).catch(() => undefined)
         await state.proc.dispose()
       }),
     )
@@ -219,17 +260,24 @@ export class SessionManager {
     const existing = this.states.get(sessionID)
     if (existing && !existing.proc.isClosed) return existing
     if (existing) this.states.delete(sessionID)
-    return await this.start(sessionID)
+    const inFlight = this.starting.get(sessionID)
+    if (inFlight) return inFlight
+    const start = this.start(sessionID).finally(() => this.starting.delete(sessionID))
+    this.starting.set(sessionID, start)
+    return start
   }
 
   private async start(sessionID: string): Promise<SessionState> {
+    if (this.disposed) throw new Error("Antigravity ACP plugin was disposed")
     const state: SessionState = {
       sessionID,
       proc: undefined as unknown as AcpProcess,
       acpSessionId: "",
+      cwd: this.options.directory,
       catalog: [],
       modes: [],
-      mode: this.options.mode,
+      supportsImage: false,
+      mode: undefined,
       agent: this.agents.get(sessionID) ?? "build",
       cancelled: false,
       permissionCancels: new Set(),
@@ -253,28 +301,43 @@ export class SessionManager {
       await proc.initialize()
       // The forum clarification recommends explicitly authenticating the
       // selected non-consumer method so cached consumer OAuth is not reused
-      // by an outer harness. `authenticate` ignores "already authenticated".
-      if (resolveAcpAuthMethod() !== "oauth-personal") {
-        await proc.authenticate()
+      // by an outer harness. For enterprise methods, fail closed if the server
+      // only says "already authenticated" and we cannot verify the method.
+      const authMethod = resolveAcpAuthMethod()
+      if (authMethod !== "oauth-personal") {
+        const strict =
+          !this.options.allowConsumerAuth &&
+          (authMethod === "oauth-business" ||
+            (authMethod === "agent-platform" &&
+              !process.env.GOOGLE_APPLICATION_CREDENTIALS &&
+              !process.env.GOOGLE_CLOUD_PROJECT))
+        await proc.authenticate(undefined, { strict })
       }
       const stored = await this.readStored(sessionID)
       let session: any
-      if (stored?.acpSessionId) {
+      let acpSessionId: string
+      if (stored?.acpSessionId && stored.cwd === this.options.directory) {
         try {
           session = await proc.resumeSession({
             sessionId: stored.acpSessionId,
             cwd: this.options.directory,
-            mcpServers: [],
           })
+          // ACP v1 `session/resume` does not return `sessionId`; keep the
+          // stored id. Only accept a returned id if it matches.
+          const returned = typeof session?.sessionId === "string" ? session.sessionId : undefined
+          acpSessionId = returned ?? stored.acpSessionId
         } catch {
           session = await this.newSession(proc)
+          acpSessionId = String(session.sessionId)
         }
       } else {
         session = await this.newSession(proc)
+        acpSessionId = String(session.sessionId)
       }
 
-      state.acpSessionId = String(session.sessionId)
-      state.catalog = buildModelCatalog(session)
+      state.acpSessionId = acpSessionId
+      state.catalog = this.mergeCatalog(buildModelCatalog(session))
+      state.supportsImage = proc.promptCapabilities.image === true
       state.modes = Array.isArray(session.modes?.availableModes)
         ? session.modes.availableModes
             .map((mode: any) => (typeof mode?.id === "string" ? mode.id : undefined))
@@ -282,9 +345,15 @@ export class SessionManager {
         : []
       state.model = stored?.model
       state.effort = stored?.effort
-      state.mode = stored?.mode ?? this.options.mode
+      // Always honour the current plugin config. A persisted `auto` must not
+      // silently outlive a config change back to `default`; applyMode writes
+      // the confirmed mode below.
 
-      await this.applyMode(state)
+      await this.applyMode(state, this.options.mode)
+      if (this.disposed) {
+        await proc.dispose()
+        throw new Error("Antigravity ACP plugin was disposed during session startup")
+      }
       this.states.set(sessionID, state)
       await this.writeStored(state)
       return state
@@ -306,31 +375,71 @@ export class SessionManager {
     }
   }
 
+  private mergeCatalog(discovered: readonly AcpDiscoveredModel[]): readonly AcpDiscoveredModel[] {
+    if (discovered.length === 0) return this.fallbackCatalog
+    const fallback = new Map(this.fallbackCatalog.map((model) => [model.id, model]))
+    return discovered.map((model) => {
+      if (model.variants.length > 0) return model
+      const known = fallback.get(model.id)
+      return known && known.variants.length > 0
+        ? { ...model, variants: known.variants, defaultAcpModelId: known.defaultAcpModelId }
+        : model
+    })
+  }
+
   private async applyModel(state: SessionState, model: string, variant?: string): Promise<void> {
     const target = resolveAcpModelTarget(state.catalog, model, variant ?? this.options.effort)
-    if (!target) return
-    if (state.model === target.baseModelId && state.effort === target.thoughtLevel) return
+    if (!target || !target.baseModelId) {
+      throw new Error(`Antigravity does not expose model "${model}". Select another model and retry.`)
+    }
+    // A catalog built from `availableModels` only may use effort-qualified ids.
+    // Split them so the strict config-option confirmation matches the server.
+    const qualified = /^(.*)-(low|medium|high|xhigh)$/.exec(target.baseModelId)
+    const desiredBase = qualified ? qualified[1] : target.baseModelId
+    const desiredEffort = target.thoughtLevel ?? qualified?.[2]
+    if (state.model === desiredBase && state.effort === desiredEffort) return
 
+    let modelResult: any
     try {
       // `configOptions` is the canonical ACP v1 surface. Antigravity exposes
       // model and thought level as two selectors; use the model result to
       // learn which thought levels remain valid before setting the effort.
-      const modelResult = await state.proc.setConfigOption(
+      modelResult = await state.proc.setConfigOption(
         state.acpSessionId,
         "model",
-        target.baseModelId,
+        desiredBase,
       )
-      const options = Array.isArray(modelResult?.configOptions) ? modelResult.configOptions : []
-      const thought = options.find((option: any) => option?.id === "thought_level")
-      const levels = Array.isArray(thought?.options)
-        ? thought.options.map((option: any) => String(option.value))
-        : []
-      let effort = target.thoughtLevel
-      if (effort && levels.length > 0 && !levels.includes(effort)) {
-        effort = typeof thought?.currentValue === "string" ? thought.currentValue : undefined
+    } catch (error) {
+      throw this.modelError(state, model, error)
+    }
+
+    const options = Array.isArray(modelResult?.configOptions) ? modelResult.configOptions : []
+    const modelOption = options.find((option: any) => option?.id === "model")
+    if (typeof modelOption?.currentValue !== "string" || modelOption.currentValue !== desiredBase) {
+      throw this.modelError(
+        state,
+        model,
+        new Error(`the server confirmed "${modelOption?.currentValue ?? "unknown"}"`),
+      )
+    }
+
+    const thought = options.find((option: any) => option?.id === "thought_level")
+    const levels = Array.isArray(thought?.options)
+      ? thought.options.map((option: any) => String(option.value))
+      : []
+    let effort = desiredEffort
+    if (effort) {
+      if (levels.length === 0) {
+        throw this.modelError(state, model, new Error(`the model has no thought-level selector`))
       }
-      if (!effort && typeof thought?.currentValue === "string") effort = thought.currentValue
-      if (effort) {
+      if (!levels.includes(effort)) {
+        throw this.modelError(
+          state,
+          model,
+          new Error(`the model does not offer thought level "${effort}"`),
+        )
+      }
+      try {
         const effortResult = await state.proc.setConfigOption(
           state.acpSessionId,
           "thought_level",
@@ -339,37 +448,68 @@ export class SessionManager {
         const confirmed = effortResult?.configOptions?.find(
           (option: any) => option?.id === "thought_level",
         )?.currentValue
-        if (typeof confirmed === "string") effort = confirmed
+        if (typeof confirmed !== "string" || confirmed !== effort) {
+          throw new Error(`the server confirmed "${confirmed ?? "unknown"}"`)
+        }
+      } catch (error) {
+        throw this.modelError(state, model, error)
       }
-      state.model = target.baseModelId
-      state.effort = effort
-      await this.writeStored(state)
-    } catch (error) {
-      state.lastError = error instanceof Error ? error.message : String(error)
+    } else if (typeof thought?.currentValue === "string") {
+      effort = thought.currentValue
     }
+
+    state.model = desiredBase
+    state.effort = effort
+    await this.writeStored(state)
   }
 
-  private async applyMode(state: SessionState): Promise<void> {
-    if (!state.mode) return
-    if (state.modes.length > 0 && !state.modes.includes(state.mode)) {
-      state.lastError = `Antigravity does not offer mode "${state.mode}"`
-      return
+  private modelError(state: SessionState, model: string, error: unknown): Error {
+    const reason = error instanceof Error ? error.message : String(error)
+    state.lastError = reason
+    return new Error(
+      `Antigravity could not switch to model "${model}": ${reason}. The turn was not sent; ` +
+        "pick another model or refresh the model catalog.",
+    )
+  }
+
+  private async applyMode(
+    state: SessionState,
+    requested: string | undefined,
+    force = false,
+  ): Promise<void> {
+    const mode = requested ?? this.options.mode
+    if (!mode) return
+    if (state.mode === mode && !force) return
+    if (state.modes.length === 0) {
+      if (mode === "default") {
+        state.mode = mode
+        return
+      }
+      throw new Error(`Antigravity does not expose session modes; cannot apply "${mode}".`)
     }
-    if (state.modes.length === 0) return
+    if (!state.modes.includes(mode)) {
+      throw new Error(`Antigravity does not offer mode "${mode}".`)
+    }
+
     try {
-      // The config option returns the complete state; `session/set_mode`
-      // returns `{}` and may only confirm via a later notification.
-      const result = await state.proc.setConfigOption(state.acpSessionId, "mode", state.mode)
+      const result = await state.proc.setConfigOption(state.acpSessionId, "mode", mode)
       const confirmed = result?.configOptions?.find((option: any) => option?.id === "mode")?.currentValue
-      if (typeof confirmed === "string" && confirmed !== state.mode) {
-        state.lastError = `Antigravity confirmed mode "${confirmed}" instead of "${state.mode}"`
+      if (typeof confirmed === "string" && confirmed !== mode) {
+        throw new Error(`the server confirmed "${confirmed}"`)
       }
-    } catch {
-      try {
-        await state.proc.setMode(state.acpSessionId, state.mode)
-      } catch (error) {
-        state.lastError = error instanceof Error ? error.message : String(error)
+      if (typeof confirmed !== "string" && mode !== "default") {
+        throw new Error("the server did not confirm the mode")
       }
+      state.mode = mode
+    } catch (error) {
+      if (mode !== "default") {
+        throw new Error(
+          `Antigravity could not apply mode "${mode}": ${error instanceof Error ? error.message : String(error)}. ` +
+            "The turn was not sent.",
+        )
+      }
+      await state.proc.setMode(state.acpSessionId, mode)
+      state.mode = mode
     }
   }
 
@@ -388,7 +528,7 @@ export class SessionManager {
     const denyOption = rejectOnce ?? rejectAlways
     const allowOption = this.options.permission === "allow" ? allowOnce ?? allowAlways : allowOnce
 
-    if (this.options.permission === "allow") return select(allowOption)
+    if (this.options.permission === "allow") return select(allowOption ?? denyOption)
     if (this.options.permission === "deny") return select(denyOption)
     if (!allowOption) {
       // OpenCode's `assert` only grants a single decision, so do not turn it
@@ -451,6 +591,7 @@ export class SessionManager {
       await Effect.runPromise(
         this.ctx.storage.set(`${STORAGE_PREFIX}${state.sessionID}`, {
           acpSessionId: state.acpSessionId,
+          cwd: state.cwd,
           model: state.model,
           effort: state.effort,
           mode: state.mode,

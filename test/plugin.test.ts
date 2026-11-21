@@ -82,6 +82,10 @@ describe("catalog", () => {
     expect(gpt?.defaultAcpModelId).toBe("gpt-oss-120b-medium")
   })
 
+  test("returns an empty catalog when the session has no model information", () => {
+    expect(buildModelCatalog({})).toEqual([])
+  })
+
   test("resolves the effort-qualified model id for session/set_model", () => {
     const catalog = buildModelCatalog(session)
     expect(resolveAcpModelTarget(catalog, "gemini-3.8-flash", "low")).toMatchObject({
@@ -131,6 +135,16 @@ describe("prompt", () => {
     ])
   })
 
+  test("does not re-send an earlier prompt when the latest turn has no supported content", () => {
+    const blocks = promptToBlocks([
+      { role: "user", content: [{ type: "text", text: "delete the old logs" }] },
+      { role: "user", content: [{ type: "file", mediaType: "application/pdf", data: "x" }] },
+    ])
+    expect(blocks).toEqual([
+      { type: "text", text: "[file omitted: application/pdf is not an inline image]" },
+    ])
+  })
+
   test("uses a continuation marker when the user turn has no content", () => {
     expect(promptToBlocks([{ role: "user", content: [] }])).toEqual([
       { type: "text", text: "[continue]" },
@@ -139,6 +153,55 @@ describe("prompt", () => {
 })
 
 describe("stream mapping", () => {
+  test("does not spend an ACP turn on title/compaction and rejects stateless generate", async () => {
+    let calls = 0
+    const model = new AntigravityLanguageModel("gemini-3.8-flash", {
+      run: async () => {
+        calls += 1
+        return { stopReason: "end_turn" }
+      },
+    })
+
+    const title = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      headers: { "x-opencode-session-id": "s-1", "x-opencode-request-kind": "title" },
+    } as any)
+    const titleParts = await collect(title.stream)
+    expect(titleParts.some((part) => part.type === "text-delta" && part.delta === "Antigravity session")).toBe(true)
+
+    const compaction = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      headers: { "x-opencode-session-id": "s-1", "x-opencode-request-kind": "compaction" },
+    } as any)
+    const compactionParts = await collect(compaction.stream)
+    expect(compactionParts.some((part) => part.type === "text-delta")).toBe(true)
+
+    await expect(
+      model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        headers: { "x-opencode-session-id": "s-1", "x-opencode-request-kind": "generate" },
+      } as any),
+    ).rejects.toThrow("does not support stateless generate")
+    expect(calls).toBe(0)
+  })
+
+  test("rejects header-less calls instead of merging them into __default__", async () => {
+    let calls = 0
+    const model = new AntigravityLanguageModel("gemini-3.8-flash", {
+      run: async () => {
+        calls += 1
+        return { stopReason: "end_turn" }
+      },
+    })
+    await expect(
+      model.doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        headers: {},
+      } as any),
+    ).rejects.toThrow("requires an OpenCode session ID")
+    expect(calls).toBe(0)
+  })
+
   test("renders text, reasoning, provider-executed tools and usage", async () => {
     const run = async (
       _sessionID: string,

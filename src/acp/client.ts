@@ -6,6 +6,14 @@ import { StringDecoder } from "node:string_decoder"
 
 const MAX_FRAME_BYTES = 32 * 1024 * 1024
 
+/** Redact URL/userinfo-ish material before putting stderr in an error. */
+function redact(text: string): string {
+  return text
+    .replace(/https?:\/\/[^\s]+/gi, "<url>")
+    .replace(/(bearer\s+)[^\s]+/gi, "$1<redacted>")
+    .replace(/([?&](?:code|token|access_token|refresh_token)=)[^&\s]+/gi, "$1<redacted>")
+}
+
 export class AgyNotFoundError extends Error {
   constructor(binary: string) {
     super(
@@ -157,6 +165,17 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
     ],
   },
   {
+    id: "gemini-4-carbon",
+    name: "Gemini 4 Carbon",
+    family: "gemini-4-carbon",
+    defaultAcpModelId: "gemini-4-carbon-high",
+    variants: [
+      { id: "low", acpModelId: "gemini-4-carbon-low", thoughtLevel: "low" },
+      { id: "medium", acpModelId: "gemini-4-carbon-medium", thoughtLevel: "medium" },
+      { id: "high", acpModelId: "gemini-4-carbon-high", thoughtLevel: "high" },
+    ],
+  },
+  {
     id: "gemini-4-argon",
     name: "Gemini 4 Argon",
     family: "gemini-4-argon",
@@ -187,17 +206,24 @@ export const FALLBACK_MODELS: readonly AcpDiscoveredModel[] = [
     variants: [],
   },
   {
-    id: "gemini-pro-orchestrator-g1-pro",
+    id: "gemini-pro-orchestrator",
+    name: "Orchestrator (Carbon)",
+    family: "gemini-pro-orchestrator",
+    defaultAcpModelId: "gemini-pro-orchestrator",
+    variants: [],
+  },
+  {
+    id: "gemini-pro-orchestrator-argon",
     name: "Orchestrator (Argon)",
-    family: "gemini-pro-orchestrator-g1-pro",
-    defaultAcpModelId: "gemini-pro-orchestrator-g1-pro",
+    family: "gemini-pro-orchestrator-argon",
+    defaultAcpModelId: "gemini-pro-orchestrator-argon",
     variants: [],
   },
   {
     id: "gemini-3.8-flash",
     name: "Gemini 3.8 Flash",
     family: "gemini-3.8-flash",
-    defaultAcpModelId: "gemini-3.8-flash-medium",
+    defaultAcpModelId: "gemini-3.8-flash-high",
     variants: [
       { id: "low", acpModelId: "gemini-3.8-flash-low", thoughtLevel: "low" },
       { id: "medium", acpModelId: "gemini-3.8-flash-medium", thoughtLevel: "medium" },
@@ -254,7 +280,7 @@ export function buildModelCatalog(sessionResult: any): readonly AcpDiscoveredMod
     : []
 
   if (baseList.length === 0 && availableModels.length === 0) {
-    return FALLBACK_MODELS
+    return []
   }
 
   if (baseList.length === 0) {
@@ -359,8 +385,6 @@ export function resolveAcpModelTarget(
 export interface AcpProcessOptions {
   readonly cwd: string
   readonly binaryPath?: string
-  readonly extraDirs?: readonly string[]
-  readonly dangerouslySkipPermissions?: boolean
   readonly onUpdate?: (sessionId: string, update: AcpSessionUpdate) => void
   readonly onPermissionRequest?: (
     params: AcpPermissionRequestParams,
@@ -453,19 +477,18 @@ export class AcpProcess {
 
   constructor(private readonly options: AcpProcessOptions) {
     const args = ["acp", "--stdio", "--process-per-session"]
-    if (options.dangerouslySkipPermissions) {
-      args.push("--dangerously-skip-permissions")
-    }
-    for (const dir of options.extraDirs ?? []) {
-      if (dir) args.push("--add-dir", dir)
-    }
 
     const binary = options.binaryPath ?? resolveAgyBinary()
+    // Node refuses to spawn .cmd/.bat without a shell on Windows. The args
+    // here are fixed, and `command` is user-controlled plugin config, so this
+    // does not add an untrusted-input shell path.
+    const shell = process.platform === "win32" && /\.(cmd|bat)$/i.test(binary)
     this.proc = spawn(binary, args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: buildAgySpawnEnv(),
       detached: process.platform !== "win32",
+      shell,
     })
 
     this.proc.stdout.on("data", (chunk: Buffer) => {
@@ -493,6 +516,11 @@ export class AcpProcess {
       }
     })
 
+    this.proc.stdin.on("error", (error) => {
+      this.closed = true
+      this.failAllPending(error)
+    })
+
     this.proc.on("error", (err) => {
       this.closed = true
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
@@ -504,7 +532,7 @@ export class AcpProcess {
 
     this.proc.on("exit", (code, signal) => {
       this.closed = true
-      const tail = this.stderrLines.join("\n")
+      const tail = redact(this.stderrLines.join("\n"))
       this.failAllPending(
         new Error(
           `agy acp exited unexpectedly (code=${code}, signal=${signal})${tail ? `\n${tail}` : ""}`,
@@ -573,7 +601,7 @@ export class AcpProcess {
       try {
         const outcome: AcpPermissionOutcome = this.options.onPermissionRequest
           ? await this.options.onPermissionRequest(params as AcpPermissionRequestParams)
-          : await this.fallbackAutoSelect(params)
+          : await this.fallbackDeny(params)
         this.write({ jsonrpc: "2.0", id, result: { outcome } })
       } catch (err) {
         this.write({
@@ -592,22 +620,27 @@ export class AcpProcess {
     })
   }
 
-  private async fallbackAutoSelect(params: AcpPermissionRequestParams): Promise<AcpPermissionOutcome> {
+  private async fallbackDeny(params: AcpPermissionRequestParams): Promise<AcpPermissionOutcome> {
     const opts = params?.options ?? []
-    const allow = opts.find(
+    const deny = opts.find(
       (o) =>
-        o.kind?.includes("allow") ||
-        o.optionId.includes("allow") ||
-        o.optionId.includes("approve"),
+        o.kind?.includes("reject") ||
+        o.kind?.includes("deny") ||
+        o.optionId.includes("reject") ||
+        o.optionId.includes("deny"),
     )
-    if (allow) return { outcome: "selected", optionId: allow.optionId }
-    if (opts[0]) return { outcome: "selected", optionId: opts[0].optionId }
+    if (deny) return { outcome: "selected", optionId: deny.optionId }
     return { outcome: "cancelled" }
   }
 
-  private write(payload: unknown): void {
-    if (this.closed || !this.proc.stdin.writable) return
-    this.proc.stdin.write(`${JSON.stringify(payload)}\n`)
+  private write(payload: unknown): boolean {
+    if (this.closed || !this.proc.stdin.writable) return false
+    try {
+      this.proc.stdin.write(`${JSON.stringify(payload)}\n`)
+      return true
+    } catch {
+      return false
+    }
   }
 
   request<T = any>(method: string, params: unknown, timeoutMs?: number): Promise<T> {
@@ -624,7 +657,11 @@ export class AcpProcess {
             }, timeoutMs)
           : undefined
       this.pending.set(id, { resolve, reject, timer })
-      this.write({ jsonrpc: "2.0", id, method, params })
+      if (!this.write({ jsonrpc: "2.0", id, method, params })) {
+        if (timer) clearTimeout(timer)
+        this.pending.delete(id)
+        reject(new Error(`Cannot call ${method}: agy acp stdin is not writable`))
+      }
     })
   }
 
@@ -632,16 +669,33 @@ export class AcpProcess {
     this.write({ jsonrpc: "2.0", method, params })
   }
 
-  initialize(): Promise<any> {
-    return this.request(
+  private initValue: any
+
+  async initialize(): Promise<any> {
+    const result = await this.request(
       "initialize",
       {
         protocolVersion: 1,
-        clientCapabilities: {},
-        clientInfo: { name: "acp-bridge", version: "0.2.0" },
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        },
+        clientInfo: { name: "opencode-antigravity-acp", version: "0.1.0" },
       },
       15_000,
     )
+    if (result?.protocolVersion !== 1) {
+      throw new Error(
+        `Unsupported ACP protocol version ${String(result?.protocolVersion)}; this plugin speaks ACP v1.`,
+      )
+    }
+    this.initValue = result
+    return result
+  }
+
+  /** Prompt capabilities from `initialize` (image/audio/embeddedContext). */
+  get promptCapabilities(): { readonly image?: boolean; readonly audio?: boolean; readonly embeddedContext?: boolean } {
+    return this.initValue?.agentCapabilities?.promptCapabilities ?? {}
   }
 
   newSession(params: {
@@ -658,14 +712,11 @@ export class AcpProcess {
   resumeSession(params: {
     readonly sessionId: string
     readonly cwd: string
-    readonly mcpServers?: readonly AcpMcpServerHttp[]
   }): Promise<any> {
-    const payload: any = {
-      sessionId: params.sessionId,
-      cwd: params.cwd,
-      mcpServers: params.mcpServers ? [...params.mcpServers] : [],
-    }
-    return this.request("session/resume", payload, 20_000)
+    // ACP v1 ResumeSessionRequest is sessionId + cwd (+ optional
+    // additionalDirectories/systemPrompt). Do not send mcpServers here; the
+    // resumed session already has its original MCP configuration.
+    return this.request("session/resume", { sessionId: params.sessionId, cwd: params.cwd }, 20_000)
   }
 
   setModel(sessionId: string, modelId: string): Promise<any> {
@@ -688,7 +739,10 @@ export class AcpProcess {
    * Benign already-authenticated errors resolve `undefined` so cached/env
    * auth keeps working seamlessly. Unknown servers resolve `undefined`.
    */
-  async authenticate(params?: AcpAuthenticateParams): Promise<any | undefined> {
+  async authenticate(
+    params?: AcpAuthenticateParams,
+    options?: { readonly strict?: boolean },
+  ): Promise<any | undefined> {
     const rawMethod = params?.methodId
     const methodId =
       rawMethod && (KNOWN_AUTH_METHODS as readonly string[]).includes(rawMethod)
@@ -711,8 +765,25 @@ export class AcpProcess {
       return await this.request("authenticate", payload, 120_000)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      if (/Method not found|Unsupported client method|-32601/.test(msg)) return undefined
-      if (/already (authenticated|logged in|signed in)/i.test(msg)) return undefined
+      if (/Method not found|Unsupported client method|-32601/.test(msg)) {
+        if (options?.strict) {
+          throw new Error(
+            `The ACP server does not support auth method "${methodId}". ` +
+              "Use GEMINI_API_KEY or a server/CLI version that advertises this method.",
+          )
+        }
+        return undefined
+      }
+      if (/already (authenticated|logged in|signed in)/i.test(msg)) {
+        if (options?.strict) {
+          throw new Error(
+            `The ACP server reports an existing authenticated session, but the plugin cannot verify it uses ` +
+              `auth method "${methodId}". Run \`agy acp --login\` or \`/logout\` so cached consumer OAuth is not ` +
+              "reused, or use GEMINI_API_KEY. Set allowConsumerAuth only if you accept the consumer boundary.",
+          )
+        }
+        return undefined
+      }
       throw err
     }
   }
@@ -732,8 +803,17 @@ export class AcpProcess {
 
   private terminate(signal: NodeJS.Signals): void {
     const pid = this.proc.pid
+    if (process.platform === "win32" && pid) {
+      try {
+        spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true,
+        })
+      } catch {}
+      return
+    }
     try {
-      if (process.platform !== "win32" && pid) process.kill(-pid, signal)
+      if (pid) process.kill(-pid, signal)
       else this.proc.kill(signal)
     } catch {
       try {

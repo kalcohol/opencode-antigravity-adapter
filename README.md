@@ -31,14 +31,14 @@ Sources:
 
 That is the closest fit to the forum's "thin client" description. It is still an OpenCode plugin, and the FAQ names OpenCode, so this is a boundary judgment rather than a legal guarantee. `allowConsumerAuth: true` is the explicit acknowledgment that you will keep it strict-thin. If you later add injected system prompts, OpenCode tool schemas, replayed cross-model context, or MCP relay/Code Mode, switch to `GEMINI_API_KEY` or `agent-platform` — those are the paths the forum reply recommends for an outer harness. This is an engineering reading of the public sources, not legal advice.
 
-If you use `GEMINI_API_KEY` or `agent-platform`, the plugin calls ACP `authenticate` explicitly for that method so cached consumer OAuth is not silently reused (per the forum reply). It does not delete or modify your `agy` credentials.
+If you use `GEMINI_API_KEY` or `agent-platform`, the plugin calls ACP `authenticate` explicitly for that method so cached consumer OAuth is not silently reused (per the forum reply). For `oauth-business`/`agent-platform`, if the server only answers "already authenticated" and the plugin cannot verify the effective method, it **fails closed** unless `allowConsumerAuth: true`; run `agy acp --login`/`/logout` or use `GEMINI_API_KEY`. It does not delete or modify your `agy` credentials.
 
 ---
 
 ## Status
 
 - `bun run typecheck` passes.
-- `bun run test` passes (6 unit tests: catalog grouping, model target resolution, prompt extraction, stream mapping).
+- `bun run test` passes (10 unit tests: catalog grouping, model target resolution, prompt extraction, stream mapping, auxiliary-request handling).
 - `ANTIGRAVITY_ACP_LIVE=1 bun test live.test.ts` passes against the real local `agy` 1.5.14: `initialize`, `session/new`, real catalog, and `session/set_config_option` model switch. It does **not** send a prompt.
 - `bun run test:integration` passes end-to-end with a mock ACP agent: OpenCode loads the provider, selects `antigravity-acp/gemini-3.8-flash`, streams a tool call + text, and exits 0. This test does not touch Antigravity or quota.
 - A real Antigravity prompt has **not** been run from this plugin yet; that consumes account quota and is the step where the consumer thin-client boundary applies. Run it only after deciding on the auth path.
@@ -50,7 +50,9 @@ If you use `GEMINI_API_KEY` or `agent-platform`, the plugin calls ACP `authentic
 - Uses ACP v1: `initialize`, `session/new` / `session/resume`, `session/set_config_option` (model / thought level / mode), `session/prompt`, `session/cancel`, `session/close`.
 - Streams Antigravity text, thoughts, tool calls and tool results as AI SDK `LanguageModelV3` stream parts.
 - Marks Antigravity-native tools as `providerExecuted`, so OpenCode displays them but never runs them a second time.
-- Routes ACP `session/request_permission` into OpenCode's permission system (`ask`), or auto-allows/denies if configured.
+- Routes ACP `session/request_permission` into OpenCode's permission system (`ask`), or auto-allows/denies if configured. `ask` forces a prompt for `antigravity.*` even though OpenCode's default agent policy is allow-all; headless runs deny when no unattended allow is configured.
+- Fails the turn if a requested model/effort cannot be confirmed, instead of silently running the previous model.
+- Handles title/compaction locally (no ACP turn); stateless `generate` is rejected.
 - Caches the model catalog so the picker can show models before `agy` answers; refreshes it in the background.
 - Derives a local title instead of spending an ACP turn on title generation.
 
@@ -112,20 +114,23 @@ ln -s /absolute/path/to/opencode-antigravity-adapter ~/.config/opencode/plugins/
 
 OpenCode discovers immediate package directories there. The plugin's `package.json` exports `./src/index.ts` as its entrypoint.
 
+Auto-discovery passes no plugin options, so `allowConsumerAuth` is false. For a consumer `oauth-personal` login, set `ANTIGRAVITY_ACP_ALLOW_CONSUMER=1` in the environment that launches OpenCode, or use the `opencode.json` object form above. API-key/enterprise paths work without that flag.
+
 ## Options
 
 | Option | Values | Default | Meaning |
 | --- | --- | --- | --- |
-| `permission` | `ask` \| `allow` \| `deny` | `ask` | How Antigravity's `session/request_permission` is answered. `ask` uses OpenCode's permission UI. |
+| `permission` | `ask` \| `allow` \| `deny` | `ask` | How Antigravity's `session/request_permission` is answered. `ask` forces OpenCode's permission prompt for `antigravity.*`; headless without an unattended allow denies. |
 | `mode` | `default` \| `accept-edits` \| `auto` \| `plan` | `default` | ACP session mode applied when the ACP session starts. |
 | `effort` | `low` \| `medium` \| `high` \| `xhigh` | model default | Fallback reasoning effort when OpenCode sends no variant. |
 | `command` | path | `agy` / `AGY_BIN` | The Antigravity CLI binary. |
-| `allowConsumerAuth` | `true` \| `false` | `false` | Opt in to the consumer `oauth-personal` login. Without it, consumer auth is refused before any prompt and model discovery is skipped. |
+| `allowConsumerAuth` | `true` \| `false` | `false` | Opt in to the consumer `oauth-personal` login. Without it, consumer auth is refused before any prompt and model discovery is skipped. Also enabled by `ANTIGRAVITY_ACP_ALLOW_CONSUMER=1`. |
 
 Environment:
 
 - `GEMINI_API_KEY` → `gemini-api-key` auth (lower-risk documented path for third-party agents).
 - `ANTIGRAVITY_ACP_AUTH_METHOD` → force `oauth-personal`, `oauth-business`, `gemini-api-key` or `agent-platform`.
+- `ANTIGRAVITY_ACP_ALLOW_CONSUMER=1` → `allowConsumerAuth` for auto-discovered plugins.
 - `AGY_BIN` → binary path if `command` is not set.
 - `GOOGLE_APPLICATION_CREDENTIALS` / `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_LOCATION` → `agent-platform` auth.
 
@@ -138,25 +143,39 @@ Environment:
 - API key: export `GEMINI_API_KEY` in the environment that launches OpenCode. Keep it out of shared or committed config files.
 - Enterprise: use `ANTIGRAVITY_ACP_AUTH_METHOD=oauth-business` (browser sign-in) or `agent-platform` with ADC.
 - If `session/new` returns `Authentication required` (code `-32000`), the plugin tries `authenticate` once with the resolved method, then retries. If that fails, check `agy` manually.
+- For `oauth-business` / `agent-platform`, the plugin calls `authenticate` explicitly. If the server reports an existing session instead of confirming the requested method, the plugin fails closed unless `allowConsumerAuth: true`; this prevents silently reusing cached consumer OAuth. Use `GEMINI_API_KEY` or run `agy acp --login`/`/logout` as needed.
 
 ## Permissions and safety
 
-- `permission: "ask"` maps each ACP permission request to `ctx.permission.assert()` with the tool title, locations and raw input. Allow/deny comes from OpenCode's permission rules and UI.
+- `permission: "ask"` maps each ACP permission request to `ctx.permission.assert()` with the tool title, locations and raw input. The plugin forces `effect: "ask"` for `antigravity.*` actions unless you configured an explicit `antigravity.*` rule, so OpenCode's default `* allow` policy cannot silently auto-approve. In headless/CI (`opencode run`, no unattended allow), the request is denied rather than allowed.
+- To allow a specific class of Antigravity actions (for example, in headless runs), add an explicit rule:
+  ```jsonc
+  { "permissions": [{ "action": "antigravity.*", "resource": "*", "effect": "allow" }] }
+  ```
+  A `deny` or `ask` rule is respected as written. Only the catch-all `{ "action": "*", "resource": "*" }` default is overridden to `ask`.
 - `permission: "allow"` selects an allow option for every request; `"deny"` selects a reject option. Use these deliberately.
+- `mode: "auto"` / `"accept-edits"` can make Antigravity stop sending permission requests; OpenCode cannot gate a request the agent never makes. Default mode is `default`. Do not combine `mode: "auto"` with `permission: "ask"` if you expect every native tool action to be reviewed.
 - Antigravity-native tools execute inside the `agy` process with your OS privileges. OpenCode's permission gate is a UX/approval layer, not a sandbox. Use `agy`'s own permission settings and `--sandbox` if you need isolation.
 - The plugin does not pass `--dangerously-skip-permissions` by default.
 - One turn per OpenCode session at a time; interrupt/cancel sends ACP `session/cancel` and closes pending permission requests.
+- OpenCode auto-retry is disabled for this provider: a failed turn may already have executed tools, so resend manually rather than risking a duplicate tool run.
+- The `agy` child inherits the parent environment (except Google keys on OAuth paths). Do not launch OpenCode with unrelated secrets in the environment; use a dedicated shell/profile if needed.
+- A wedged ACP turn has no hard total timeout; interrupt it from OpenCode. Foreground turns can run as long as Antigravity is making progress.
 
 ## Limitations (v0.1)
 
 - No MCP relay / Code Mode. Antigravity uses its own tools; OpenCode tools are not exposed to it.
 - No `session/list`, `session/load` history replay, `terminal-login`, elicitation forms, or mid-turn steering.
-- One ACP session per OpenCode session; `session/resume` is used after a restart, but if it fails a new session starts and prior ACP history is lost.
-- Compaction/generate requests are not specially routed; they run a normal ACP turn (and consume quota). The title hook avoids a title turn.
-- A cold start uses a small fallback catalog until the background `agy acp` discovery finishes; the fallback may be stale or list a model the account cannot use.
+- ACP v1 only; a server that negotiates v2 is rejected.
+- One ACP session per OpenCode session; `session/resume` is used after a restart and keeps the stored ACP id/cwd. If resume fails or the cwd changed, a new session starts and prior ACP history is lost.
+- When the OpenCode agent is `plan`, the plugin applies ACP `plan` mode and fails the turn if the mode cannot be confirmed. Other agents use the `mode` option.
+- Title and compaction are handled locally without an ACP turn. The compaction summary is generic; Antigravity's ACP history remains authoritative. Stateless `generate` requests are rejected.
+- A model/effort switch that cannot be confirmed aborts the turn instead of silently using the previous model.
+- A cold start uses a small fallback catalog until the background `agy acp` discovery finishes; the fallback may be stale or list a model the account cannot use. Selecting an unavailable model fails that turn.
+- Windows: `.cmd`/`.bat` spawns use a shell and process-tree kill uses `taskkill /T /F`; a POSIX detached child can still be orphaned if OpenCode is SIGKILLed.
 - Model context/output limits are estimates (1M / 64k), not values reported by the account.
 - Titles are derived locally from the first user message; no title model turn is spent.
-- Images are passed through as ACP image blocks; arbitrary embedded resources are not yet.
+- Inline base64/Uint8Array images are passed through when the ACP server advertises image prompts; image URLs and non-image files are replaced with a visible text note, not silently dropped.
 - No GUI component. This is a server plugin; the TUI-only `cli.json` workflow does not apply.
 
 ## Development

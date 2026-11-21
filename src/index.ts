@@ -8,7 +8,7 @@
 import { Model, Plugin, Provider } from "@opencode/plugin/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Effect, Stream } from "effect"
-import { AntigravityLanguageModel } from "./language-model.js"
+import { AntigravityLanguageModel, COMPACTION_SUMMARY } from "./language-model.js"
 import { SessionManager, type AcpMode, type PermissionMode } from "./session.js"
 import { discoverAcpModels, FALLBACK_MODELS, resolveAcpAuthMethod, type AcpDiscoveredModel } from "./acp/client.js"
 
@@ -19,6 +19,12 @@ export const PLUGIN_ID = "antigravity-acp"
 const CATALOG_KEY = "catalog"
 const CONTEXT_LIMIT = 1_048_576
 const OUTPUT_LIMIT = 65_536
+
+/** Stable per-location pointer so cached AISDK models follow a plugin reload. */
+class ManagerRef {
+  current?: SessionManager
+}
+const managerRefs = new Map<string, ManagerRef>()
 
 interface Options {
   readonly directory: string
@@ -46,7 +52,8 @@ function normalizeOptions(ctx: Context): Options {
     permission,
     mode,
     effort: typeof raw.effort === "string" && raw.effort.trim() ? raw.effort.trim() : undefined,
-    allowConsumerAuth: raw.allowConsumerAuth === true,
+    allowConsumerAuth:
+      raw.allowConsumerAuth === true || process.env.ANTIGRAVITY_ACP_ALLOW_CONSUMER === "1",
   }
 }
 
@@ -58,6 +65,7 @@ function toModels(catalog: readonly AcpDiscoveredModel[]): Model.Info[] {
       ...base,
       name: model.name,
       family: Model.Family.make(model.family || model.id),
+      package: PACKAGE,
       capabilities: {
         ...base.capabilities,
         tools: true,
@@ -76,15 +84,25 @@ function toModels(catalog: readonly AcpDiscoveredModel[]): Model.Info[] {
 function isCatalog(value: unknown): value is readonly AcpDiscoveredModel[] {
   return (
     Array.isArray(value) &&
-    value.every(
-      (model) =>
-        model &&
-        typeof model === "object" &&
-        typeof (model as AcpDiscoveredModel).id === "string" &&
-        typeof (model as AcpDiscoveredModel).name === "string" &&
-        typeof (model as AcpDiscoveredModel).defaultAcpModelId === "string" &&
-        Array.isArray((model as AcpDiscoveredModel).variants),
-    )
+    value.every((raw) => {
+      if (!raw || typeof raw !== "object") return false
+      const model = raw as AcpDiscoveredModel
+      return (
+        typeof model.id === "string" &&
+        typeof model.name === "string" &&
+        (model.family === undefined || typeof model.family === "string") &&
+        typeof model.defaultAcpModelId === "string" &&
+        Array.isArray(model.variants) &&
+        model.variants.every(
+          (variant) =>
+            variant &&
+            typeof variant === "object" &&
+            typeof variant.id === "string" &&
+            typeof variant.acpModelId === "string" &&
+            (variant.thoughtLevel === undefined || typeof variant.thoughtLevel === "string"),
+        )
+      )
+    })
   )
 }
 
@@ -92,8 +110,24 @@ const register = Effect.fn("AntigravityACP.register")(function* (
   ctx: Context,
   catalog: readonly AcpDiscoveredModel[],
 ) {
+  const models = toModels(catalog)
   yield* ctx.provider.transform((editor) => {
-    if (editor.get(PROVIDER_ID)) editor.remove(PROVIDER_ID)
+    const existing = editor.get(PROVIDER_ID)
+    if (existing) {
+      editor.update(PROVIDER_ID, (provider) => {
+        provider.name = "Antigravity (ACP)"
+        provider.activation = "enabled"
+        provider.package = PACKAGE
+      })
+      // Preserve user/other-plugin models, but replace our own stale ones.
+      const next = new Map(existing.models)
+      for (const [id, model] of next) {
+        if (model.package === PACKAGE) next.delete(id)
+      }
+      for (const model of models) next.set(String(model.id), model)
+      editor.models.set(PROVIDER_ID, [...next.values()])
+      return
+    }
     editor.add({
       info: {
         ...Provider.Info.empty(PROVIDER_ID),
@@ -101,7 +135,7 @@ const register = Effect.fn("AntigravityACP.register")(function* (
         activation: "enabled",
         package: PACKAGE,
       },
-      models: toModels(catalog),
+      models,
     })
   })
 })
@@ -147,12 +181,44 @@ const titleFromMessages = (messages: ReadonlyArray<unknown>): string | undefined
   return undefined
 }
 
+/**
+ * OpenCode's default agent policy is `{ action: "*", resource: "*", effect: "allow" }`.
+ * A custom `antigravity.*` action would therefore be allowed silently in a
+ * headless `opencode run`. In `permission: "ask"` mode, force a prompt unless
+ * the user added a specific rule for `antigravity.*`; the Agent/Session rules
+ * are inspected here because the permission hook only receives the computed
+ * effect, not the ruleset.
+ */
+const wildcard = (pattern: string, value: string): boolean => {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")
+  return new RegExp(`^${escaped}$`).test(value)
+}
+
+const ruleMatches = (
+  rule: { action: string; resource: string },
+  action: string,
+  resources: ReadonlyArray<string>,
+): boolean =>
+  wildcard(rule.action, action) && resources.every((resource) => wildcard(rule.resource, resource))
+
 export default Plugin.define({
   id: PLUGIN_ID,
   effect: (ctx) =>
     Effect.gen(function* () {
+      // The CLI/ACP server runs locally; skip remote workspaces where we
+      // cannot spawn a local process.
+      if (ctx.location.workspaceID !== undefined) return
+
       const options = normalizeOptions(ctx)
       const manager = new SessionManager(ctx, options)
+      const ref = managerRefs.get(options.directory) ?? new ManagerRef()
+      managerRefs.set(options.directory, ref)
+      ref.current = manager
+      const currentManager = () => {
+        const current = ref.current
+        if (!current) throw new Error("Antigravity ACP plugin is reloading; send a new message")
+        return current
+      }
 
       const consumerAuth = resolveAcpAuthMethod() === "oauth-personal"
       if (consumerAuth && !options.allowConsumerAuth) {
@@ -175,14 +241,21 @@ export default Plugin.define({
         )
       }
 
-      yield* Effect.addFinalizer(() => Effect.promise(() => manager.dispose()))
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(async () => {
+          if (ref.current === manager) ref.current = undefined
+          await manager.dispose()
+        }),
+      )
 
       // Register the last known catalog first so the picker has models before
       // `agy` answers. On a cold start, use a small fallback catalog and let
       // the background refresh replace it; blocking plugin activation on
       // `agy acp` can exceed OpenCode's activation deadline.
       const cachedModels = yield* cached(ctx)
-      yield* register(ctx, cachedModels.length > 0 ? cachedModels : FALLBACK_MODELS)
+      const initialCatalog = cachedModels.length > 0 ? cachedModels : FALLBACK_MODELS
+      manager.setCatalog(initialCatalog)
+      yield* register(ctx, initialCatalog)
 
       yield* ctx.aisdk.hook(
         "sdk",
@@ -193,7 +266,7 @@ export default Plugin.define({
             event.sdk = {
               languageModel: (modelID: string) => new AntigravityLanguageModel(modelID, {
                 run: (sessionID, request, onUpdate, signal) =>
-                  manager.run(sessionID, request, onUpdate, signal),
+                  currentManager().run(sessionID, request, onUpdate, signal),
               }),
             }
           }),
@@ -208,7 +281,7 @@ export default Plugin.define({
             const modelID = String(event.model.modelID ?? event.model.id)
             event.language = new AntigravityLanguageModel(modelID, {
               run: (sessionID, request, onUpdate, signal) =>
-                manager.run(sessionID, request, onUpdate, signal),
+                currentManager().run(sessionID, request, onUpdate, signal),
             })
           }),
         { providerID: PROVIDER_ID },
@@ -249,27 +322,74 @@ export default Plugin.define({
             if (String(input.model.providerID) !== String(PROVIDER_ID)) return
             if (input.result) return
             const text = titleFromMessages(input.messages)
-            if (text) input.result = text.length > 60 ? `${text.slice(0, 57)}...` : text
+            input.result = text
+              ? text.length > 60
+                ? `${text.slice(0, 57)}...`
+                : text
+              : "Antigravity session"
           }),
         { providerID: PROVIDER_ID },
       )
 
-      // Auth/quota/permission failures are not transient; retrying them burns
-      // quota or repeats the same denial.
+      // Antigravity owns its own ACP conversation history. OpenCode compaction
+      // is local; do not spend an ACP turn on it or store Antigravity's reply
+      // as a "summary". The next primary turn still sends only the current
+      // user message to the existing ACP session.
+      yield* ctx.session.hook(
+        "compaction",
+        (input) =>
+          Effect.sync(() => {
+            if (String(input.model.providerID) !== String(PROVIDER_ID)) return
+            if (input.result) return
+            input.result = {
+              summary: COMPACTION_SUMMARY,
+            }
+          }),
+        { providerID: PROVIDER_ID },
+      )
+
+      // ACP turns are expensive and may have side effects (tool calls). Never
+      // let OpenCode auto-retry our provider; the user can resend manually.
       yield* ctx.session.hook(
         "retry",
         (input) =>
           Effect.sync(() => {
             if (String(input.model.providerID) !== String(PROVIDER_ID)) return
-            if (
-              /consumer login|oauth-personal|Authentication required|Antigravity consumer login is disabled|RESOURCE_EXHAUSTED|quota|rate limit|\(code 429\)|\(code 403\)|PERMISSION_DENIED/i.test(
-                input.error.message,
-              )
-            ) {
-              input.decision = { retry: false }
-            }
+            input.decision = { retry: false }
           }),
         { providerID: PROVIDER_ID },
+      )
+
+      // OpenCode's default agent policy allows `*` actions. A custom
+      // `antigravity.*` action would therefore be allowed silently, especially
+      // in headless `opencode run`. In ask mode, force a prompt unless the user
+      // configured a specific `antigravity.*` rule.
+      yield* ctx.permission.hook(
+        "evaluate",
+        (input) =>
+          Effect.gen(function* () {
+            if (options.permission !== "ask") return
+            const action = String(input.action)
+            if (!action.startsWith("antigravity.")) return
+            if (input.effect !== "allow") return
+
+            const agent = input.agent
+              ? yield* ctx.agent
+                  .get({ agentID: input.agent })
+                  .pipe(Effect.catch(() => Effect.succeed(undefined)))
+              : undefined
+            const session = yield* ctx.session
+              .get({ sessionID: input.sessionID })
+              .pipe(Effect.catch(() => Effect.succeed(undefined)))
+            const rules = [
+              ...(agent?.data.permissions ?? []),
+              ...(session?.permissions ?? []),
+            ]
+            const matching = rules.filter((rule) => ruleMatches(rule, action, input.resources))
+            const last = matching[matching.length - 1]
+            if (last && !(last.action === "*" && last.resource === "*")) return
+            input.effect = "ask"
+          }),
       )
 
       if (!consumerAuth || options.allowConsumerAuth) {
@@ -282,6 +402,7 @@ export default Plugin.define({
                   return
                 }
                 yield* remember(ctx, catalog)
+                manager.setCatalog(catalog)
                 yield* register(ctx, catalog)
                 yield* ctx.provider.reload()
               }),
@@ -294,21 +415,28 @@ export default Plugin.define({
       }
 
       yield* Effect.forkScoped(
-        ctx.event
-          .subscribe({
-            types: ["session.execution.interrupted", "session.execution.failed", "session.deleted"],
-          })
-          .pipe(
-            Stream.runForEach((event) => {
-              const sessionID = (event as { data?: { sessionID?: unknown } }).data?.sessionID
-              if (typeof sessionID !== "string" || sessionID.length === 0) return Effect.void
-              if (event.type === "session.deleted") {
-                return Effect.promise(() => manager.close(sessionID))
-              }
-              return Effect.promise(() => manager.cancel(sessionID))
-            }),
-            Effect.catch(() => Effect.void),
-          ),
+        Effect.gen(function* () {
+          while (true) {
+            yield* ctx.event
+              .subscribe({
+                types: ["session.execution.interrupted", "session.execution.failed", "session.deleted"],
+              })
+              .pipe(
+                Stream.runForEach((event) => {
+                  const sessionID = (event as { data?: { sessionID?: unknown } }).data?.sessionID
+                  if (typeof sessionID !== "string" || sessionID.length === 0) return Effect.void
+                  if (event.type === "session.deleted") {
+                    return Effect.promise(() => manager.close(sessionID))
+                  }
+                  return Effect.promise(() => manager.cancel(sessionID))
+                }),
+                Effect.catch((cause) =>
+                  Effect.logWarning(`Antigravity event subscription ended: ${cause}`),
+                ),
+              )
+            yield* Effect.sleep("1 second")
+          }
+        }),
       )
     }),
 })
