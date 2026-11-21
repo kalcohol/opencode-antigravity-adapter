@@ -202,6 +202,41 @@ describe("stream mapping", () => {
     expect(calls).toBe(0)
   })
 
+  test("preserves late tool rawInput and rawOutput", async () => {
+    const run = async (
+      _sessionID: string,
+      _request: unknown,
+      onUpdate: (update: AcpSessionUpdate) => void,
+    ): Promise<AcpPromptResult> => {
+      onUpdate({
+        sessionUpdate: "tool_call",
+        toolCallId: "call-late",
+        name: "run_command",
+        status: "pending",
+      })
+      onUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "call-late",
+        name: "run_command",
+        status: "completed",
+        rawInput: { command: "pwd" },
+        rawOutput: "raw command output",
+      } as any)
+      return { stopReason: "end_turn" }
+    }
+    const model = new AntigravityLanguageModel("gemini-3.8-flash", { run })
+    const { stream } = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+      headers: { "x-opencode-session-id": "s-1" },
+    } as any)
+    const parts = await collect(stream)
+    const result = parts.find((part) => part.type === "tool-result")
+    expect(result.result).toMatchObject({
+      input: '{"command":"pwd"}',
+      rawOutput: "raw command output",
+    })
+  })
+
   test("renders text, reasoning, provider-executed tools and usage", async () => {
     const run = async (
       _sessionID: string,

@@ -419,16 +419,17 @@ export default Plugin.define({
           while (true) {
             yield* ctx.event
               .subscribe({
-                types: ["session.execution.interrupted", "session.execution.failed", "session.deleted"],
+                // Cancellation/interruption already reaches the model through
+                // its AbortSignal. Listening to execution.failed/interrupted
+                // here can cancel a newer turn from a late event, so only
+                // session deletion is handled.
+                types: ["session.deleted"],
               })
               .pipe(
                 Stream.runForEach((event) => {
                   const sessionID = (event as { data?: { sessionID?: unknown } }).data?.sessionID
                   if (typeof sessionID !== "string" || sessionID.length === 0) return Effect.void
-                  if (event.type === "session.deleted") {
-                    return Effect.promise(() => manager.close(sessionID))
-                  }
-                  return Effect.promise(() => manager.cancel(sessionID))
+                  return Effect.promise(() => manager.close(sessionID))
                 }),
                 Effect.catch((cause) =>
                   Effect.logWarning(`Antigravity event subscription ended: ${cause}`),

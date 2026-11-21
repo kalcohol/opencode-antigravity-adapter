@@ -63,6 +63,7 @@ interface StoredSession {
 interface ActiveTurn {
   readonly onUpdate: (update: AcpSessionUpdate) => void
   cancelled: boolean
+  abort?: () => void
 }
 
 interface SessionState {
@@ -80,6 +81,7 @@ interface SessionState {
   active?: ActiveTurn
   cancelled: boolean
   readonly permissionCancels: Set<() => void>
+  readonly modeWaiters: Set<(mode: string) => void>
   lastError?: string
 }
 
@@ -169,28 +171,61 @@ export class SessionManager {
 
       return await new Promise<AcpPromptResult>((resolve, reject) => {
         let settled = false
+        let aborted = false
         const settle = (fn: () => void) => {
           if (settled) return
           settled = true
           cleanup()
           fn()
         }
+        if (signal.aborted) {
+          state.cancelled = true
+          cancelPermissions(state)
+          settle(() => reject(new Error("Antigravity turn was cancelled before it started")))
+          return
+        }
+        const raw = state.proc.prompt(state.acpSessionId, prompt)
         const onAbort = () => {
+          if (aborted) return
+          aborted = true
           active.cancelled = true
           state.cancelled = true
           cancelPermissions(state)
           void state.proc.cancel(state.acpSessionId)
-          settle(() => reject(new Error("Antigravity turn was cancelled")))
+          void (async () => {
+            let timedOut = false
+            const timer = setTimeout(() => {
+              timedOut = true
+              state.proc.killImmediate()
+            }, 2_000)
+            timer.unref?.()
+            await raw.catch(() => undefined)
+            clearTimeout(timer)
+            // Reset the process so late updates/permission requests from the
+            // cancelled turn cannot leak into the next turn. The ACP session
+            // id stays in storage, so the next turn resumes it in a new process.
+            await state.proc.dispose()
+            if (this.states.get(sessionID) === state) this.states.delete(sessionID)
+            settle(() =>
+              reject(
+                new Error(
+                  timedOut
+                    ? "Antigravity turn was cancelled; the ACP process did not acknowledge in time and was reset."
+                    : "Antigravity turn was cancelled",
+                ),
+              ),
+            )
+          })()
         }
-        if (signal.aborted) {
-          onAbort()
-          return
-        }
+        active.abort = onAbort
         signal.addEventListener("abort", onAbort, { once: true })
         cleanup = () => signal.removeEventListener("abort", onAbort)
-        state.proc.prompt(state.acpSessionId, prompt).then(
-          (result) => settle(() => resolve(result)),
+        raw.then(
+          (result) => {
+            if (!aborted) settle(() => resolve(result))
+          },
           (error) => {
+            if (aborted) return
             if ((error as { acpCode?: unknown })?.acpCode === -32002) {
               void this.close(sessionID)
               settle(() =>
@@ -217,7 +252,10 @@ export class SessionManager {
     const state = this.states.get(sessionID)
     if (!state) return
     state.cancelled = true
-    if (state.active) state.active.cancelled = true
+    if (state.active?.abort) {
+      state.active.abort()
+      return
+    }
     cancelPermissions(state)
     await state.proc.cancel(state.acpSessionId).catch(() => undefined)
   }
@@ -249,7 +287,14 @@ export class SessionManager {
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
-    await Promise.allSettled([...this.starting.values()])
+    await Promise.allSettled(
+      [...this.starting.values()].map((start) =>
+        Promise.race([
+          start.catch(() => undefined),
+          new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+        ]),
+      ),
+    )
     const states = [...this.states.values()]
     this.states.clear()
     this.starting.clear()
@@ -291,17 +336,27 @@ export class SessionManager {
       agent: this.agents.get(sessionID) ?? "build",
       cancelled: false,
       permissionCancels: new Set(),
+      modeWaiters: new Set(),
     }
 
     const proc = new AcpProcess({
       cwd: this.options.directory,
       binaryPath: this.options.command,
       onUpdate: (_acpSessionID, update) => {
+        if (update.sessionUpdate === "current_mode_update") {
+          const next = (update as { currentModeId?: unknown }).currentModeId
+          if (typeof next === "string") {
+            state.mode = next
+            for (const waiter of [...state.modeWaiters]) waiter(next)
+          }
+        }
         state.active?.onUpdate(update)
       },
       onPermissionRequest: (params) => this.permission(state, params),
       onExit: (_code, _signal, stderrTail) => {
         state.lastError = stderrTail
+        state.cancelled = true
+        cancelPermissions(state)
         state.active = undefined
       },
     })
@@ -315,13 +370,10 @@ export class SessionManager {
       // only says "already authenticated" and we cannot verify the method.
       const authMethod = resolveAcpAuthMethod()
       if (authMethod !== "oauth-personal") {
-        const strict =
-          !this.options.allowConsumerAuth &&
-          (authMethod === "oauth-business" ||
-            (authMethod === "agent-platform" &&
-              !process.env.GOOGLE_APPLICATION_CREDENTIALS &&
-              !process.env.GOOGLE_CLOUD_PROJECT))
-        await proc.authenticate(undefined, { strict })
+        // Fail closed unless the user explicitly accepts the consumer
+        // boundary. "Already authenticated" is not proof that this method is
+        // the one in effect.
+        await proc.authenticate(undefined, { strict: !this.options.allowConsumerAuth })
       }
       const stored = await this.readStored(sessionID)
       let session: any
@@ -353,8 +405,15 @@ export class SessionManager {
             .map((mode: any) => (typeof mode?.id === "string" ? mode.id : undefined))
             .filter((id: string | undefined): id is string => Boolean(id))
         : []
-      state.model = stored?.model
-      state.effort = stored?.effort
+      // Initialize from the actual session response, not from the stored
+      // binding. A failed resume creates a fresh session with its own default
+      // model; trusting the old cache here would skip applyModel and run the
+      // wrong model while persisting the requested one.
+      const configOptions = Array.isArray(session.configOptions) ? session.configOptions : []
+      const currentModel = configOptions.find((option: any) => option?.id === "model")?.currentValue
+      const currentEffort = configOptions.find((option: any) => option?.id === "thought_level")?.currentValue
+      state.model = typeof currentModel === "string" ? currentModel : undefined
+      state.effort = typeof currentEffort === "string" ? currentEffort : undefined
       // Always honour the current plugin config. A persisted `auto` must not
       // silently outlive a config change back to `default`; applyMode writes
       // the confirmed mode below.
@@ -501,16 +560,32 @@ export class SessionManager {
       throw new Error(`Antigravity does not offer mode "${mode}".`)
     }
 
+    const waitForMode = (timeoutMs: number) =>
+      new Promise<boolean>((resolve) => {
+        const waiter = (next: string) => {
+          if (next !== mode) return
+          clearTimeout(timer)
+          state.modeWaiters.delete(waiter)
+          resolve(true)
+        }
+        const timer = setTimeout(() => {
+          state.modeWaiters.delete(waiter)
+          resolve(false)
+        }, timeoutMs)
+        timer.unref?.()
+        state.modeWaiters.add(waiter)
+      })
+
     try {
       const result = await state.proc.setConfigOption(state.acpSessionId, "mode", mode)
       const confirmed = result?.configOptions?.find((option: any) => option?.id === "mode")?.currentValue
-      if (typeof confirmed === "string" && confirmed !== mode) {
-        throw new Error(`the server confirmed "${confirmed}"`)
+      if (typeof confirmed === "string") {
+        if (confirmed !== mode) throw new Error(`the server confirmed "${confirmed}"`)
+        state.mode = mode
+        return
       }
-      if (typeof confirmed !== "string" && mode !== "default") {
-        throw new Error("the server did not confirm the mode")
-      }
-      state.mode = mode
+      if (await waitForMode(500)) return
+      throw new Error("the server did not confirm the mode")
     } catch (error) {
       if (mode !== "default") {
         throw new Error(
@@ -518,8 +593,16 @@ export class SessionManager {
             "The turn was not sent.",
         )
       }
-      await state.proc.setMode(state.acpSessionId, mode)
-      state.mode = mode
+      try {
+        await state.proc.setMode(state.acpSessionId, mode)
+        if (await waitForMode(500)) return
+        throw new Error("the server did not confirm the mode")
+      } catch (fallback) {
+        throw new Error(
+          `Antigravity could not confirm mode "default": ` +
+            `${fallback instanceof Error ? fallback.message : String(fallback)}. The turn was not sent.`,
+        )
+      }
     }
   }
 

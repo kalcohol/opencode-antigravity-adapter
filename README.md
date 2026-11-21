@@ -38,7 +38,7 @@ If you use `GEMINI_API_KEY` or `agent-platform`, the plugin calls ACP `authentic
 ## Status
 
 - `bun run typecheck` passes.
-- `bun run test` passes (10 unit tests: catalog grouping, model target resolution, prompt extraction, stream mapping, auxiliary-request handling).
+- `bun run test` passes (11 unit tests: catalog grouping, model target resolution, prompt extraction, stream mapping, auxiliary-request handling).
 - `ANTIGRAVITY_ACP_LIVE=1 bun test live.test.ts` passes against the real local `agy` 1.5.14: `initialize`, `session/new`, real catalog, and `session/set_config_option` model switch. It does **not** send a prompt.
 - `bun run test:integration` passes end-to-end with a mock ACP agent: OpenCode loads the provider, selects `antigravity-acp/gemini-3.8-flash`, streams a tool call + text, and exits 0. This test does not touch Antigravity or quota.
 - A real Antigravity prompt has **not** been run from this plugin yet; that consumes account quota and is the step where the consumer thin-client boundary applies. Run it only after deciding on the auth path.
@@ -143,7 +143,8 @@ Environment:
 - API key: export `GEMINI_API_KEY` in the environment that launches OpenCode. Keep it out of shared or committed config files.
 - Enterprise: use `ANTIGRAVITY_ACP_AUTH_METHOD=oauth-business` (browser sign-in) or `agent-platform` with ADC.
 - If `session/new` returns `Authentication required` (code `-32000`), the plugin tries `authenticate` once with the resolved method, then retries. If that fails, check `agy` manually.
-- For `oauth-business` / `agent-platform`, the plugin calls `authenticate` explicitly. If the server reports an existing session instead of confirming the requested method, the plugin fails closed unless `allowConsumerAuth: true`; this prevents silently reusing cached consumer OAuth. Use `GEMINI_API_KEY` or run `agy acp --login`/`/logout` as needed.
+- For any non-consumer method (`gemini-api-key`, `oauth-business`, `agent-platform`), the plugin calls `authenticate` explicitly. If the server reports an existing session instead of confirming the requested method, the plugin fails closed unless `allowConsumerAuth: true`; this prevents silently reusing cached consumer OAuth. Run `agy acp --login`/`/logout` as needed.
+- An unknown non-empty `ANTIGRAVITY_ACP_AUTH_METHOD` is rejected instead of silently falling back to `oauth-personal`.
 
 ## Permissions and safety
 
@@ -170,12 +171,13 @@ Environment:
 - One ACP session per OpenCode session; `session/resume` is used after a restart and keeps the stored ACP id/cwd. If resume fails or the cwd changed, a new session starts and prior ACP history is lost.
 - When the OpenCode agent is `plan`, the plugin applies ACP `plan` mode and fails the turn if the mode cannot be confirmed. Other agents use the `mode` option.
 - Title and compaction are handled locally without an ACP turn. The compaction summary is generic; Antigravity's ACP history remains authoritative. Stateless `generate` requests are rejected.
+- All mode changes require confirmation from `configOptions.currentValue` or a matching `current_mode_update`; a bare `{}` from `session/set_config_option`/`session/set_mode` is not accepted as proof. The default-mode fallback also fails closed.
 - A model/effort switch that cannot be confirmed aborts the turn instead of silently using the previous model.
 - A cold start uses a small fallback catalog until the background `agy acp` discovery finishes; the fallback may be stale or list a model the account cannot use. Selecting an unavailable model fails that turn.
 - Windows: `.cmd`/`.bat` spawns use a shell and process-tree kill uses `taskkill /T /F`; a POSIX detached child can still be orphaned if OpenCode is SIGKILLed.
 - Model context/output limits are estimates (1M / 64k), not values reported by the account.
 - Titles are derived locally from the first user message; no title model turn is spent.
-- Inline base64/Uint8Array images are passed through when the ACP server advertises image prompts; image URLs and non-image files are replaced with a visible text note, not silently dropped.
+- Inline base64/Uint8Array images are passed through when the ACP server advertises image prompts; image URLs and non-image files are replaced with a text marker **inside the prompt** (not an OpenCode warning), so the agent sees that content was omitted. The marker is not shown as a separate host warning.
 - No GUI component. This is a server plugin; the TUI-only `cli.json` workflow does not apply.
 
 ## Development

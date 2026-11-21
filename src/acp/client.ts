@@ -5,6 +5,8 @@ import path from "node:path"
 import { StringDecoder } from "node:string_decoder"
 
 const MAX_FRAME_BYTES = 32 * 1024 * 1024
+const MAX_STDERR_BYTES = 16 * 1024
+const MAX_STDERR_LINE = 4 * 1024
 
 /** Redact URL/userinfo-ish material before putting stderr in an error. */
 function redact(text: string): string {
@@ -418,7 +420,13 @@ const KNOWN_AUTH_METHODS: readonly string[] = [
  */
 export function resolveAcpAuthMethod(env: NodeJS.ProcessEnv = process.env): AcpAuthMethodId {
   const override = env.ANTIGRAVITY_ACP_AUTH_METHOD?.trim()
-  if (override && (KNOWN_AUTH_METHODS as readonly string[]).includes(override)) {
+  if (override) {
+    if (!(KNOWN_AUTH_METHODS as readonly string[]).includes(override)) {
+      throw new Error(
+        `Unknown ANTIGRAVITY_ACP_AUTH_METHOD "${override}". Use one of: ` +
+          `${KNOWN_AUTH_METHODS.join(", ")}.`,
+      )
+    }
     return override as AcpAuthMethodId
   }
   if (env.GEMINI_API_KEY?.trim()) return "gemini-api-key"
@@ -471,8 +479,10 @@ export class AcpProcess {
   private nextId = 1
   private pending = new Map<number, PendingRpc>()
   private buffer = ""
+  private bufferedBytes = 0
   private decoder = new StringDecoder("utf8")
   private stderrLines: string[] = []
+  private stderrBytes = 0
   private closed = false
 
   constructor(private readonly options: AcpProcessOptions) {
@@ -493,7 +503,8 @@ export class AcpProcess {
 
     this.proc.stdout.on("data", (chunk: Buffer) => {
       this.buffer += this.decoder.write(chunk)
-      if (this.buffer.length > MAX_FRAME_BYTES) {
+      this.bufferedBytes += chunk.length
+      if (this.bufferedBytes > MAX_FRAME_BYTES) {
         this.closed = true
         this.failAllPending(new Error(`ACP frame exceeded ${MAX_FRAME_BYTES} bytes`))
         this.terminate("SIGKILL")
@@ -501,18 +512,25 @@ export class AcpProcess {
       }
       let nl: number
       while ((nl = this.buffer.indexOf("\n")) !== -1) {
-        const line = this.buffer.slice(0, nl).trim()
+        const raw = this.buffer.slice(0, nl)
         this.buffer = this.buffer.slice(nl + 1)
+        this.bufferedBytes = Math.max(0, this.bufferedBytes - Buffer.byteLength(raw, "utf8") - 1)
+        const line = raw.trim()
         if (line.length > 0) this.handleLine(line)
       }
     })
 
     this.proc.stderr.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8")
-      for (const line of text.split(/\r?\n/)) {
+      for (const raw of text.split(/\r?\n/)) {
+        const line = raw.slice(0, MAX_STDERR_LINE)
         if (!line.trim()) continue
         this.stderrLines.push(line)
-        if (this.stderrLines.length > 40) this.stderrLines.shift()
+        this.stderrBytes += Buffer.byteLength(line, "utf8") + 1
+        while (this.stderrBytes > MAX_STDERR_BYTES && this.stderrLines.length > 0) {
+          const removed = this.stderrLines.shift()!
+          this.stderrBytes -= Buffer.byteLength(removed, "utf8") + 1
+        }
       }
     })
 
@@ -779,7 +797,7 @@ export class AcpProcess {
           throw new Error(
             `The ACP server reports an existing authenticated session, but the plugin cannot verify it uses ` +
               `auth method "${methodId}". Run \`agy acp --login\` or \`/logout\` so cached consumer OAuth is not ` +
-              "reused, or use GEMINI_API_KEY. Set allowConsumerAuth only if you accept the consumer boundary.",
+              "reused, or set allowConsumerAuth to accept the existing credential boundary.",
           )
         }
         return undefined

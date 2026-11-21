@@ -122,7 +122,10 @@ class Renderer {
   private reasoningOpen = false
   private readonly textID: string
   private readonly reasoningID: string
-  private readonly tools = new Map<string, { name: string }>()
+  private readonly tools = new Map<
+    string,
+    { name: string; title?: string; input?: unknown; content?: unknown; rawOutput?: unknown }
+  >()
   private readonly finished = new Set<string>()
   private contextUsage: { used: number; size: number } | undefined
 
@@ -165,9 +168,17 @@ class Renderer {
       const call = toolCall(update)
       if (!call.toolCallId) return
 
-      if (!this.tools.has(call.toolCallId)) {
-        this.tools.set(call.toolCallId, { name: call.toolName })
-        const input = JSON.stringify(call.rawInput ?? {})
+      let tool = this.tools.get(call.toolCallId)
+      if (!tool) {
+        tool = {
+          name: call.toolName,
+          title: call.title,
+          input: call.rawInput,
+          content: call.content,
+          rawOutput: call.rawOutput,
+        }
+        this.tools.set(call.toolCallId, tool)
+        const input = JSON.stringify(tool.input ?? {})
         this.controller.enqueue({
           type: "tool-input-start",
           id: call.toolCallId,
@@ -183,6 +194,12 @@ class Renderer {
           input,
           providerExecuted: true,
         })
+      } else {
+        if (call.toolName !== "unknown") tool.name = call.toolName
+        if (call.title) tool.title = call.title
+        if (call.rawInput !== undefined) tool.input = call.rawInput
+        if (call.content !== undefined) tool.content = call.content
+        if (call.rawOutput !== undefined) tool.rawOutput = call.rawOutput
       }
 
       if ((call.status === "completed" || call.status === "failed") && !this.finished.has(call.toolCallId)) {
@@ -190,11 +207,13 @@ class Renderer {
         this.controller.enqueue({
           type: "tool-result",
           toolCallId: call.toolCallId,
-          toolName: this.tools.get(call.toolCallId)?.name ?? call.toolName,
+          toolName: tool.name,
           result: {
             status: call.status,
-            title: call.title,
-            content: call.content === undefined ? undefined : JSON.stringify(call.content),
+            title: tool.title,
+            input: asJson(tool.input),
+            content: tool.content === undefined ? undefined : JSON.stringify(tool.content),
+            rawOutput: asJson(tool.rawOutput),
           },
           isError: call.status === "failed",
         })
@@ -223,7 +242,13 @@ class Renderer {
         type: "tool-result",
         toolCallId: id,
         toolName: tool.name,
-        result: { status: result.stopReason === "cancelled" ? "cancelled" : "incomplete" },
+        result: {
+          status: result.stopReason === "cancelled" ? "cancelled" : "incomplete",
+          title: tool.title,
+          input: asJson(tool.input),
+          content: tool.content === undefined ? undefined : JSON.stringify(tool.content),
+          rawOutput: asJson(tool.rawOutput),
+        },
         isError: true,
       })
     }
@@ -310,6 +335,9 @@ function contentText(content: unknown): string | undefined {
   return undefined
 }
 
+const asJson = (value: unknown): string | undefined =>
+  value === undefined ? undefined : typeof value === "string" ? value : JSON.stringify(value)
+
 function toolCall(update: AcpSessionUpdate) {
   return {
     toolCallId: String(update.toolCallId ?? ""),
@@ -317,6 +345,7 @@ function toolCall(update: AcpSessionUpdate) {
     status: String(update.status ?? "pending"),
     title: typeof update.title === "string" ? update.title : undefined,
     rawInput: update.rawInput ?? update.args,
+    rawOutput: update.rawOutput,
     content: update.content,
   }
 }
