@@ -103,6 +103,7 @@ export class SessionManager {
   private readonly states = new Map<string, SessionState>()
   private readonly agents = new Map<string, string>()
   private readonly starting = new Map<string, Promise<SessionState>>()
+  private readonly closing = new Set<string>()
   private fallbackCatalog: readonly AcpDiscoveredModel[] = []
   private disposed = false
 
@@ -223,10 +224,17 @@ export class SessionManager {
 
   /** Close the ACP session and its process, and remove its persisted binding. */
   async close(sessionID: string): Promise<void> {
+    this.closing.add(sessionID)
     const pending = this.starting.get(sessionID)
-    if (pending) await pending.catch(() => undefined)
+    if (pending) {
+      await Promise.race([
+        pending.catch(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ])
+    }
     const state = this.states.get(sessionID)
     if (!state) return
+    this.closing.delete(sessionID)
     this.states.delete(sessionID)
     this.agents.delete(sessionID)
     state.cancelled = true
@@ -245,6 +253,7 @@ export class SessionManager {
     const states = [...this.states.values()]
     this.states.clear()
     this.starting.clear()
+    this.closing.clear()
     this.agents.clear()
     await Promise.allSettled(
       states.map(async (state) => {
@@ -262,6 +271,7 @@ export class SessionManager {
     if (existing) this.states.delete(sessionID)
     const inFlight = this.starting.get(sessionID)
     if (inFlight) return inFlight
+    this.closing.delete(sessionID)
     const start = this.start(sessionID).finally(() => this.starting.delete(sessionID))
     this.starting.set(sessionID, start)
     return start
@@ -350,9 +360,9 @@ export class SessionManager {
       // the confirmed mode below.
 
       await this.applyMode(state, this.options.mode)
-      if (this.disposed) {
+      if (this.disposed || this.closing.has(sessionID)) {
         await proc.dispose()
-        throw new Error("Antigravity ACP plugin was disposed during session startup")
+        throw new Error("Antigravity ACP session was closed during startup")
       }
       this.states.set(sessionID, state)
       await this.writeStored(state)
