@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+coverage/
+*.tsbuildinfo
+*.tgz
+
+# Logs and caches
+*.log
+.cache/
+.tmp/
+.temp/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.npmrc
+opencode.json
+opencode.jsonc
+cli.json
+tui.json
+.opencode/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Reference checkouts are large and reproducible from ref/README.md.
+# Keep the index, Markdown notes, CLI snapshot and probe scripts; ignore
+# cloned repositories, raw HTML/JSON snapshots, and local probe logs.
+/ref/*
+!/ref/README.md
+!/ref/notes/
+/ref/notes/*
+!/ref/notes/*.md
+!/ref/notes/*.txt
+!/ref/notes/probe-*.mjs

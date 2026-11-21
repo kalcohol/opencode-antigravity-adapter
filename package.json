@@ -1,0 +1,45 @@
+{
+  "name": "opencode-antigravity-acp-local",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone OpenCode V2 provider plugin for Google Antigravity through the official `agy acp` runtime.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "cd test && bun test",
+    "build": "tsc -p tsconfig.build.json",
+    "pack": "npm pack --dry-run",
+    "test:integration": "bash scripts/integration-mock.sh"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "antigravity",
+    "acp",
+    "agent-client-protocol"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode/plugin": "^2.3.2",
+    "effect": "^4.1.0"
+  },
+  "devDependencies": {
+    "@ai-sdk/provider": "3.0.8",
+    "@opencode/plugin": "2.3.2",
+    "@types/node": "^22.0.0",
+    "bun-types": "latest",
+    "effect": "4.1.0",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
