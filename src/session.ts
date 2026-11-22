@@ -87,6 +87,23 @@ interface SessionState {
 
 const STORAGE_PREFIX = "session:"
 
+/**
+ * Split an effort-qualified model id only when the catalog also exposes the
+ * base model. Standalone ids such as `gpt-oss-120b-medium` must not become
+ * `gpt-oss-120b`.
+ */
+export function splitEffortQualified(
+  catalog: readonly AcpDiscoveredModel[],
+  baseModelId: string,
+  thoughtLevel: string | undefined,
+): { baseModelId: string; effort?: string } {
+  const match = /^(.*)-(low|medium|high|xhigh)$/.exec(baseModelId)
+  if (!match) return { baseModelId }
+  const base = match[1]
+  if (!catalog.some((model) => model.id === base)) return { baseModelId }
+  return { baseModelId: base, effort: thoughtLevel ?? match[2] }
+}
+
 const select = (option: AcpPermissionOption | undefined): AcpPermissionOutcome =>
   option ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" }
 
@@ -462,10 +479,14 @@ export class SessionManager {
       throw new Error(`Antigravity does not expose model "${model}". Select another model and retry.`)
     }
     // A catalog built from `availableModels` only may use effort-qualified ids.
-    // Split them so the strict config-option confirmation matches the server.
-    const qualified = /^(.*)-(low|medium|high|xhigh)$/.exec(target.baseModelId)
-    const desiredBase = qualified ? qualified[1] : target.baseModelId
-    const desiredEffort = target.thoughtLevel ?? qualified?.[2]
+    // Split them only when a base model exists; standalone ids keep their name.
+    const resolved = splitEffortQualified(
+      state.catalog,
+      target.baseModelId,
+      target.thoughtLevel,
+    )
+    const desiredBase = resolved.baseModelId
+    const desiredEffort = resolved.effort
     if (state.model === desiredBase && state.effort === desiredEffort) return
 
     let modelResult: any

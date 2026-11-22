@@ -38,7 +38,7 @@ If you use `GEMINI_API_KEY` or `agent-platform`, the plugin calls ACP `authentic
 ## Status
 
 - `bun run typecheck` passes.
-- `bun run test` passes (11 unit tests: catalog grouping, model target resolution, prompt extraction, stream mapping, auxiliary-request handling).
+- `bun run test` passes (13 unit tests: catalog grouping, model target resolution, prompt extraction, stream mapping, auxiliary-request handling).
 - `ANTIGRAVITY_ACP_LIVE=1 bun test live.test.ts` passes against the real local `agy` 1.5.14: `initialize`, `session/new`, real catalog, and `session/set_config_option` model switch. It does **not** send a prompt.
 - `bun run test:integration` passes end-to-end with a mock ACP agent: OpenCode loads the provider, selects `antigravity-acp/gemini-3.8-flash`, streams a tool call + text, and exits 0. This test does not touch Antigravity or quota.
 - A real Antigravity prompt has **not** been run from this plugin yet; that consumes account quota and is the step where the consumer thin-client boundary applies. Run it only after deciding on the auth path.

@@ -5,6 +5,7 @@ import {
   type AcpDiscoveredModel,
 } from "../src/acp/client.js"
 import { AntigravityLanguageModel, promptToBlocks } from "../src/language-model.js"
+import { splitEffortQualified } from "../src/session.js"
 import type { AcpPromptResult, AcpSessionUpdate } from "../src/acp/client.js"
 
 const session = {
@@ -84,6 +85,17 @@ describe("catalog", () => {
 
   test("returns an empty catalog when the session has no model information", () => {
     expect(buildModelCatalog({})).toEqual([])
+  })
+
+  test("does not split a standalone id that happens to end in -medium", () => {
+    const catalog = buildModelCatalog(session)
+    expect(splitEffortQualified(catalog, "gpt-oss-120b-medium", undefined)).toEqual({
+      baseModelId: "gpt-oss-120b-medium",
+    })
+    expect(splitEffortQualified(catalog, "gemini-3.8-flash-low", undefined)).toEqual({
+      baseModelId: "gemini-3.8-flash",
+      effort: "low",
+    })
   })
 
   test("resolves the effort-qualified model id for session/set_model", () => {
@@ -200,6 +212,37 @@ describe("stream mapping", () => {
       } as any),
     ).rejects.toThrow("requires an OpenCode session ID")
     expect(calls).toBe(0)
+  })
+
+  test("does not rename a tool from a name-less update title", async () => {
+    const run = async (
+      _sessionID: string,
+      _request: unknown,
+      onUpdate: (update: AcpSessionUpdate) => void,
+    ): Promise<AcpPromptResult> => {
+      onUpdate({
+        sessionUpdate: "tool_call",
+        toolCallId: "call-name",
+        name: "read_file",
+        title: "Read /tmp/x",
+        status: "pending",
+      })
+      onUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "call-name",
+        title: "Read /tmp/x",
+        status: "completed",
+      } as any)
+      return { stopReason: "end_turn" }
+    }
+    const model = new AntigravityLanguageModel("gemini-3.8-flash", { run })
+    const { stream } = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+      headers: { "x-opencode-session-id": "s-1" },
+    } as any)
+    const parts = await collect(stream)
+    const result = parts.find((part) => part.type === "tool-result")
+    expect(result.toolName).toBe("read_file")
   })
 
   test("preserves late tool rawInput and rawOutput", async () => {

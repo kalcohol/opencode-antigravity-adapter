@@ -171,7 +171,7 @@ class Renderer {
       let tool = this.tools.get(call.toolCallId)
       if (!tool) {
         tool = {
-          name: call.toolName,
+          name: call.name ?? call.title ?? "unknown",
           title: call.title,
           input: call.rawInput,
           content: call.content,
@@ -182,7 +182,7 @@ class Renderer {
         this.controller.enqueue({
           type: "tool-input-start",
           id: call.toolCallId,
-          toolName: call.toolName,
+          toolName: tool.name,
           providerExecuted: true,
         })
         this.controller.enqueue({ type: "tool-input-delta", id: call.toolCallId, delta: input })
@@ -190,12 +190,12 @@ class Renderer {
         this.controller.enqueue({
           type: "tool-call",
           toolCallId: call.toolCallId,
-          toolName: call.toolName,
+          toolName: tool.name,
           input,
           providerExecuted: true,
         })
       } else {
-        if (call.toolName !== "unknown") tool.name = call.toolName
+        if (call.name) tool.name = call.name
         if (call.title) tool.title = call.title
         if (call.rawInput !== undefined) tool.input = call.rawInput
         if (call.content !== undefined) tool.content = call.content
@@ -341,7 +341,9 @@ const asJson = (value: unknown): string | undefined =>
 function toolCall(update: AcpSessionUpdate) {
   return {
     toolCallId: String(update.toolCallId ?? ""),
-    toolName: String(update.name ?? update.title ?? "unknown"),
+    // `name` is the stable tool name. `title` is only display text; a
+    // name-less update must not rename the tool to its title.
+    name: typeof update.name === "string" && update.name.length > 0 ? update.name : undefined,
     status: String(update.status ?? "pending"),
     title: typeof update.title === "string" ? update.title : undefined,
     rawInput: update.rawInput ?? update.args,
