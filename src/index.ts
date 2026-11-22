@@ -11,6 +11,13 @@ import { Effect, Stream } from "effect"
 import { AntigravityLanguageModel, COMPACTION_SUMMARY } from "./language-model.js"
 import { SessionManager, type AcpMode, type PermissionMode } from "./session.js"
 import { discoverAcpModels, FALLBACK_MODELS, resolveAcpAuthMethod, type AcpDiscoveredModel } from "./acp/client.js"
+import {
+  evaluateAntigravityPermission,
+  hasAntigravityMarker,
+  readAntigravityMarker,
+  type PermissionRule,
+} from "./permission-policy.js"
+import { findPendingPermission } from "./permission-registry.js"
 
 export const PROVIDER_ID = Provider.ID.make("antigravity-acp")
 export const PACKAGE = "aisdk:antigravity-acp"
@@ -191,26 +198,6 @@ const titleFromMessages = (messages: ReadonlyArray<unknown>): string | undefined
   return undefined
 }
 
-/**
- * OpenCode's default agent policy is `{ action: "*", resource: "*", effect: "allow" }`.
- * A custom `antigravity.*` action would therefore be allowed silently in a
- * headless `opencode run`. In `permission: "ask"` mode, force a prompt unless
- * the user added a specific rule for `antigravity.*`; the Agent/Session rules
- * are inspected here because the permission hook only receives the computed
- * effect, not the ruleset.
- */
-const wildcard = (pattern: string, value: string): boolean => {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")
-  return new RegExp(`^${escaped}$`).test(value)
-}
-
-const ruleMatches = (
-  rule: { action: string; resource: string },
-  action: string,
-  resources: ReadonlyArray<string>,
-): boolean =>
-  wildcard(rule.action, action) && resources.every((resource) => wildcard(rule.resource, resource))
-
 export default Plugin.define({
   id: PLUGIN_ID,
   effect: (ctx) =>
@@ -370,18 +357,32 @@ export default Plugin.define({
         { providerID: PROVIDER_ID },
       )
 
-      // OpenCode's default agent policy allows `*` actions. A custom
-      // `antigravity.*` action would therefore be allowed silently, especially
-      // in headless `opencode run`. In ask mode, force a prompt unless the user
-      // configured a specific `antigravity.*` rule.
+      // Antigravity permissions are recomputed from their actual source rules.
+      // OpenCode's `input.effect` mixes built-in agent policy, user rules and
+      // invisible saved rules, so it is not a reliable authorization oracle.
+      // Built-in allows must never auto-approve; built-in denies are enforced
+      // by OpenCode's configured-deny fast path before this hook.
       yield* ctx.permission.hook(
         "evaluate",
         (input) =>
           Effect.gen(function* () {
             if (options.permission !== "ask") return
             const action = String(input.action)
-            if (!action.startsWith("antigravity.")) return
-            if (input.effect !== "allow") return
+            const event = input.metadata
+            const pending = findPendingPermission({
+              requestID: readAntigravityMarker(event)?.requestID,
+              sessionID: String(input.sessionID),
+              action,
+              resources: input.resources,
+            })
+
+            // Avoid loading agent/session state for ordinary OpenCode tools.
+            const namespaced = action.startsWith("antigravity.")
+            if (!hasAntigravityMarker(event) && !pending && !namespaced) return
+
+            // Keep a deny from another hook. Normally OpenCode's configured
+            // deny fast path prevents this hook from running at all.
+            if (input.effect === "deny") return
 
             const agent = input.agent
               ? yield* ctx.agent
@@ -391,14 +392,29 @@ export default Plugin.define({
             const session = yield* ctx.session
               .get({ sessionID: input.sessionID })
               .pipe(Effect.catch(() => Effect.succeed(undefined)))
-            const rules = [
-              ...(agent?.data.permissions ?? []),
-              ...(session?.permissions ?? []),
-            ]
-            const matching = rules.filter((rule) => ruleMatches(rule, action, input.resources))
-            const last = matching[matching.length - 1]
-            if (last && !(last.action === "*" && last.resource === "*")) return
-            input.effect = "ask"
+            const sessionAgent = (session as { agent?: unknown } | undefined)?.agent
+            const agentID = input.agent
+              ? String(input.agent)
+              : typeof sessionAgent === "string"
+                ? sessionAgent
+                : undefined
+            const agentRules = (agent?.data.permissions ?? []) as PermissionRule[]
+            const sessionRules = ((session as { permissions?: ReadonlyArray<unknown> } | undefined)
+              ?.permissions ?? []) as PermissionRule[]
+
+            const effect = evaluateAntigravityPermission({
+              action,
+              resources: input.resources,
+              effect: input.effect,
+              metadata: event,
+              sessionID: String(input.sessionID),
+              agentID,
+              appVersion: String(ctx.app.version),
+              agentRules,
+              sessionRules,
+              pending,
+            })
+            if (effect !== undefined) input.effect = effect
           }),
       )
 

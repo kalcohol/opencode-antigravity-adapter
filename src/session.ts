@@ -4,6 +4,7 @@
 // local plugin in this repository. The ACP transport itself lives in
 // ./acp/client.ts.
 
+import { randomUUID } from "node:crypto"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Effect } from "effect"
 import {
@@ -19,6 +20,14 @@ import {
   type AcpPromptResult,
   type AcpSessionUpdate,
 } from "./acp/client.js"
+import {
+  MAX_CACHED_TOOL_CALLS,
+  mergeToolCall,
+  permissionPlan,
+  type CachedToolCall,
+  type ToolCallPatch,
+} from "./permission-policy.js"
+import { registerPermission, unregisterPermission } from "./permission-registry.js"
 
 export type AcpMode = "default" | "accept-edits" | "auto" | "plan"
 export type PermissionMode = "ask" | "allow" | "deny"
@@ -82,6 +91,7 @@ interface SessionState {
   cancelled: boolean
   readonly permissionCancels: Set<() => void>
   readonly modeWaiters: Set<(mode: string) => void>
+  readonly toolCalls: Map<string, CachedToolCall>
   lastError?: string
 }
 
@@ -116,6 +126,58 @@ const isAuthError = (error: unknown) => {
   const message = error instanceof Error ? error.message : String(error)
   if (/auth|login|credential|sign in/i.test(message)) return true
   return (error as { acpCode?: unknown })?.acpCode === -32000 && /auth/i.test(message)
+}
+
+const hasOwn = (value: object, key: PropertyKey): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key)
+
+function cacheToolCall(state: SessionState, update: AcpSessionUpdate): void {
+  if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") return
+  const toolCallId = typeof update.toolCallId === "string" ? update.toolCallId : undefined
+  if (!toolCallId) return
+
+  const patch: {
+    -readonly [K in keyof ToolCallPatch]: ToolCallPatch[K]
+  } = {}
+  if (hasOwn(update, "kind")) patch.kind = update.kind as string | null | undefined
+  if (hasOwn(update, "name")) patch.name = update.name as string | null | undefined
+  if (hasOwn(update, "title")) patch.title = update.title as string | null | undefined
+  if (hasOwn(update, "rawInput")) patch.rawInput = update.rawInput
+  if (hasOwn(update, "locations")) patch.locations = update.locations as ToolCallPatch["locations"]
+
+  const merged = mergeToolCall(state.toolCalls.get(toolCallId), patch)
+  state.toolCalls.delete(toolCallId)
+  state.toolCalls.set(toolCallId, merged)
+  while (state.toolCalls.size > MAX_CACHED_TOOL_CALLS) {
+    const oldest = state.toolCalls.keys().next().value
+    if (oldest === undefined) break
+    state.toolCalls.delete(oldest)
+  }
+}
+
+function cachePermissionToolCall(
+  state: SessionState,
+  toolCall: NonNullable<AcpPermissionRequestParams["toolCall"]>,
+): CachedToolCall {
+  const patch: {
+    -readonly [K in keyof ToolCallPatch]: ToolCallPatch[K]
+  } = {}
+  if (hasOwn(toolCall, "kind")) patch.kind = toolCall.kind as string | null | undefined
+  if (hasOwn(toolCall, "name")) patch.name = toolCall.name as string | null | undefined
+  if (hasOwn(toolCall, "title")) patch.title = toolCall.title as string | null | undefined
+  if (hasOwn(toolCall, "rawInput")) patch.rawInput = toolCall.rawInput
+  if (hasOwn(toolCall, "locations")) patch.locations = toolCall.locations as ToolCallPatch["locations"]
+
+  const id = toolCall.toolCallId as string
+  const merged = mergeToolCall(state.toolCalls.get(id), patch)
+  state.toolCalls.delete(id)
+  state.toolCalls.set(id, merged)
+  while (state.toolCalls.size > MAX_CACHED_TOOL_CALLS) {
+    const oldest = state.toolCalls.keys().next().value
+    if (oldest === undefined) break
+    state.toolCalls.delete(oldest)
+  }
+  return merged
 }
 
 export class SessionManager {
@@ -169,6 +231,7 @@ export class SessionManager {
     const active: ActiveTurn = { onUpdate, cancelled: false }
     state.active = active
     state.cancelled = false
+    state.toolCalls.clear()
 
     let cleanup = () => {}
     try {
@@ -294,6 +357,7 @@ export class SessionManager {
     this.agents.delete(sessionID)
     state.cancelled = true
     cancelPermissions(state)
+    state.toolCalls.clear()
     // Best-effort: do not block a shared event stream for 5s.
     void state.proc.closeSession(state.acpSessionId).catch(() => undefined)
     await state.proc.dispose()
@@ -321,6 +385,7 @@ export class SessionManager {
       states.map(async (state) => {
         state.cancelled = true
         cancelPermissions(state)
+        state.toolCalls.clear()
         void state.proc.closeSession(state.acpSessionId).catch(() => undefined)
         await state.proc.dispose()
       }),
@@ -354,12 +419,14 @@ export class SessionManager {
       cancelled: false,
       permissionCancels: new Set(),
       modeWaiters: new Set(),
+      toolCalls: new Map(),
     }
 
     const proc = new AcpProcess({
       cwd: this.options.directory,
       binaryPath: this.options.command,
       onUpdate: (_acpSessionID, update) => {
+        cacheToolCall(state, update)
         if (update.sessionUpdate === "current_mode_update") {
           const next = (update as { currentModeId?: unknown }).currentModeId
           if (typeof next === "string") {
@@ -374,6 +441,7 @@ export class SessionManager {
         state.lastError = stderrTail
         state.cancelled = true
         cancelPermissions(state)
+        state.toolCalls.clear()
         state.active = undefined
       },
     })
@@ -652,17 +720,28 @@ export class SessionManager {
       return select(denyOption)
     }
 
-    const tool = params.toolCall
-    const title = String(tool?.title ?? tool?.name ?? tool?.kind ?? "Antigravity tool")
-    const resources = (tool?.locations ?? [])
-      .map((location) => location.path)
-      .filter((value): value is string => typeof value === "string" && value.length > 0)
-    if (resources.length === 0) resources.push(title)
+    const toolCall = params.toolCall
+    if (!toolCall?.toolCallId) return { outcome: "cancelled" }
+
+    const requestID = randomUUID()
+    const tool = cachePermissionToolCall(state, toolCall)
+    const plan = permissionPlan(tool, requestID, state.cwd)
 
     let cancelPermission: (() => void) | undefined
     const cancelled = new Promise<never>((_resolve, reject) => {
       cancelPermission = () => reject(new Error("Antigravity permission request was cancelled"))
       state.permissionCancels.add(cancelPermission)
+    })
+
+    registerPermission({
+      requestID,
+      sessionID: state.sessionID,
+      action: plan.action,
+      resources: plan.resources,
+      legacyAction: plan.legacyAction,
+      legacyResources: plan.legacyResources,
+      autoAllowThink: plan.autoAllowThink,
+      forceAsk: plan.forceAsk,
     })
 
     try {
@@ -671,13 +750,9 @@ export class SessionManager {
           this.ctx.permission.assert({
             sessionID: state.sessionID as any,
             agent: state.agent as any,
-            action: `antigravity.${tool?.kind ?? tool?.name ?? "tool"}`,
-            resources,
-            metadata: {
-              tool: tool?.name,
-              title,
-              rawInput: tool?.rawInput,
-            },
+            action: plan.action,
+            resources: plan.resources,
+            metadata: plan.metadata,
           }),
         ),
         cancelled,
@@ -686,6 +761,7 @@ export class SessionManager {
     } catch {
       return state.cancelled ? { outcome: "cancelled" } : select(denyOption)
     } finally {
+      unregisterPermission(requestID)
       if (cancelPermission) state.permissionCancels.delete(cancelPermission)
     }
   }

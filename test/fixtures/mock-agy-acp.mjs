@@ -9,6 +9,73 @@ const sessionId = "mock-antigravity-session"
 let model = "gemini-3.8-flash"
 let effort = "high"
 let mode = "default"
+let pendingPrompt = undefined
+let lastPermissionOutcome = "none"
+const pendingPermissionID = "mock-permission-1"
+
+const permissionTool = () => {
+  const kind = process.env.MOCK_PERMISSION_KIND ?? "execute"
+  if (kind === "read") {
+    return {
+      toolCall: {
+        toolCallId: "perm-call",
+        name: "read_file",
+        kind: "read",
+        title: "Read /tmp/mock.txt",
+        locations: [{ path: "/tmp/mock.txt" }],
+        rawInput: { Path: "/tmp/mock.txt" },
+      },
+      options: [
+        { optionId: "allow", name: "Allow", kind: "allow_once" },
+        { optionId: "deny", name: "Deny", kind: "reject_once" },
+      ],
+    }
+  }
+  if (kind === "edit") {
+    return {
+      toolCall: {
+        toolCallId: "perm-call",
+        name: "write_file",
+        kind: "edit",
+        title: "File .mock",
+        locations: [{ path: "/tmp/mock-edit.txt" }],
+        rawInput: { Path: "/tmp/mock-edit.txt", Content: "hello", Overwrite: true },
+      },
+      options: [
+        { optionId: "allow", name: "Allow", kind: "allow_once" },
+        { optionId: "deny", name: "Deny", kind: "reject_once" },
+      ],
+    }
+  }
+  if (kind === "websearch") {
+    return {
+      toolCall: {
+        toolCallId: "perm-call",
+        name: "search_web",
+        kind: "search",
+        title: '"mock query" on Web',
+        rawInput: { query: "mock query" },
+      },
+      options: [
+        { optionId: "allow", name: "Allow", kind: "allow_once" },
+        { optionId: "deny", name: "Deny", kind: "reject_once" },
+      ],
+    }
+  }
+  return {
+    toolCall: {
+      toolCallId: "perm-call",
+      name: "run_command",
+      kind: "execute",
+      title: "printf mock",
+      rawInput: { CommandLine: "printf mock" },
+    },
+    options: [
+      { optionId: "allow", name: "Allow", kind: "allow_once" },
+      { optionId: "deny", name: "Deny", kind: "reject_once" },
+    ],
+  }
+}
 
 const configOptions = () => [
   {
@@ -69,6 +136,20 @@ rl.on("line", (line) => {
     return
   }
 
+  if (message.id !== undefined && message.method === undefined) {
+    if (pendingPrompt && message.id === pendingPermissionID) {
+      const outcome = message.result?.outcome
+      lastPermissionOutcome =
+        outcome?.outcome === "selected"
+          ? String(outcome.optionId ?? "selected")
+          : String(outcome?.outcome ?? "unknown")
+      const finish = pendingPrompt
+      pendingPrompt = undefined
+      finish()
+    }
+    return
+  }
+
   if (message.method === "initialize") {
     result(message.id, {
       protocolVersion: 1,
@@ -121,7 +202,53 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "session/prompt") {
+    lastPermissionOutcome = "none"
+    const finish = () => {
+      const suffix = process.env.MOCK_PERMISSION_KIND
+        ? ` permission-outcome:${lastPermissionOutcome}`
+        : ""
+      update({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `Hello from mock Antigravity.${suffix}` },
+      })
+      update({ sessionUpdate: "usage_update", used: 10, size: 1000 })
+      result(message.id, {
+        stopReason: "end_turn",
+        usage: {
+          inputTokens: 5,
+          outputTokens: 4,
+          thoughtTokens: 1,
+          cachedReadTokens: 0,
+          cachedWriteTokens: 0,
+          totalTokens: 9,
+        },
+      })
+    }
+
     update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "mock thought" } })
+
+    if (process.env.MOCK_PERMISSION_KIND) {
+      const permission = permissionTool()
+      if (process.env.MOCK_PERMISSION_NO_ALLOW) {
+        permission.options = permission.options.filter((option) => option.kind.startsWith("reject"))
+      }
+      // Send the tool call first, then request permission with only the ID.
+      // This exercises the plugin's per-session tool-call cache.
+      update({ sessionUpdate: "tool_call", ...permission.toolCall, status: "pending" })
+      pendingPrompt = finish
+      write({
+        jsonrpc: "2.0",
+        id: pendingPermissionID,
+        method: "session/request_permission",
+        params: {
+          sessionId,
+          toolCall: { toolCallId: permission.toolCall.toolCallId },
+          options: permission.options,
+        },
+      })
+      return
+    }
+
     update({
       sessionUpdate: "tool_call",
       toolCallId: "mock-call-1",
@@ -138,22 +265,7 @@ rl.on("line", (line) => {
       status: "completed",
       content: { type: "text", text: "mock file contents" },
     })
-    update({
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "Hello from mock Antigravity." },
-    })
-    update({ sessionUpdate: "usage_update", used: 10, size: 1000 })
-    result(message.id, {
-      stopReason: "end_turn",
-      usage: {
-        inputTokens: 5,
-        outputTokens: 4,
-        thoughtTokens: 1,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-        totalTokens: 9,
-      },
-    })
+    finish()
     return
   }
 

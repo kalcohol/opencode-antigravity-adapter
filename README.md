@@ -50,7 +50,7 @@ If you use `GEMINI_API_KEY` or `agent-platform`, the plugin calls ACP `authentic
 - Uses ACP v1: `initialize`, `session/new` / `session/resume`, `session/set_config_option` (model / thought level / mode), `session/prompt`, `session/cancel`, `session/close`.
 - Streams Antigravity text, thoughts, tool calls and tool results as AI SDK `LanguageModelV3` stream parts.
 - Marks Antigravity-native tools as `providerExecuted`, so OpenCode displays them but never runs them a second time.
-- Routes ACP `session/request_permission` into OpenCode's permission system (`ask`), or auto-allows/denies if configured. `ask` forces a prompt for `antigravity.*` even though OpenCode's default agent policy is allow-all; headless runs deny when no unattended allow is configured.
+- Routes ACP `session/request_permission` into OpenCode's permission system (`ask`), or auto-allows/denies if configured. In `ask` mode, execute/read/edit/search_web are shown as `shell`/`read`/`edit`/`websearch` with their real command/path/query; built-in agent allows never auto-approve, and headless runs deny when no explicit user rule allows the action.
 - Fails the turn if a requested model/effort cannot be confirmed, instead of silently running the previous model.
 - Handles title/compaction locally (no ACP turn); stateless `generate` is rejected.
 - Caches the model catalog so the picker can show models before `agy` answers; refreshes it in the background.
@@ -120,7 +120,7 @@ Auto-discovery passes no plugin options, so `allowConsumerAuth` is false. For a 
 
 | Option | Values | Default | Meaning |
 | --- | --- | --- | --- |
-| `permission` | `ask` \| `allow` \| `deny` | `ask` | How Antigravity's `session/request_permission` is answered. `ask` forces OpenCode's permission prompt for `antigravity.*`; headless without an unattended allow denies. |
+| `permission` | `ask` \| `allow` \| `deny` | `ask` | How Antigravity's `session/request_permission` is answered. `ask` shows an informative OpenCode prompt and requires an explicit user rule to auto-allow; headless without one denies. |
 | `mode` | `default` \| `accept-edits` \| `auto` \| `plan` | `default` | ACP session mode applied when the ACP session starts. |
 | `effort` | `low` \| `medium` \| `high` \| `xhigh` | model default | Fallback reasoning effort when OpenCode sends no variant. |
 | `command` | path | `agy` / `AGY_BIN` | The Antigravity CLI binary. |
@@ -148,12 +148,35 @@ Environment:
 
 ## Permissions and safety
 
-- `permission: "ask"` maps each ACP permission request to `ctx.permission.assert()` with the tool title, locations and raw input. The plugin forces `effect: "ask"` for `antigravity.*` actions unless you configured an explicit `antigravity.*` rule, so OpenCode's default `* allow` policy cannot silently auto-approve. In headless/CI (`opencode run`, no unattended allow), the request is denied rather than allowed.
-- To allow a specific class of Antigravity actions (for example, in headless runs), add an explicit rule:
+- `permission: "ask"` maps each ACP permission request to `ctx.permission.assert()`. It does **not** trust OpenCode's computed `input.effect`: that value mixes built-in agent policy, user rules, and invisible saved rules. The plugin recomputes the decision from explicit user rules.
+- In `ask` mode the useful action mappings are:
+  - `execute` → `shell` (TUI shows `Shell command` and `- <command>`)
+  - `read` → `read` (`Read /path`)
+  - `edit` → `edit` (`Edit /path`; ACP diff is not rendered yet, so the TUI may say `No diff provided`)
+  - `search_web` → `websearch` (`Web Search via Antigravity "query"`)
+  - `delete` / `move` / `switch_mode` / other kinds stay `antigravity.*` and use the generic prompt.
+- The canonical actions can be configured with ordinary OpenCode rules:
+  ```jsonc
+  "permissions": [
+    { "action": "shell", "resource": "*", "effect": "allow" },
+    { "action": "edit", "resource": "*", "effect": "ask" },
+    { "action": "read", "resource": "*", "effect": "allow" },
+    { "action": "websearch", "resource": "*", "effect": "allow" }
+  ]
+  ```
+  `shell` and `websearch` rules are shared with OpenCode's own tools. If you want to scope a grant to Antigravity only, use a legacy rule:
   ```jsonc
   { "permissions": [{ "action": "antigravity.*", "resource": "*", "effect": "allow" }] }
   ```
-  A `deny` or `ask` rule is respected as written. Only the catch-all `{ "action": "*", "resource": "*" }` default is overridden to `ask`.
+- Legacy `antigravity.*` rules still work and are matched against the old action/resources (locations or title), so existing `antigravity.execute` / `antigravity.read` rules keep their old meaning. They cannot override a built-in agent deny that OpenCode enforces before the hook; use a canonical `shell`/`edit`/`read` allow for that.
+- `shell` allow rules are deliberately conservative:
+  - `resource: "*"` allows every command (compound commands included);
+  - `resource: "git status"` allows only that exact full command;
+  - `resource: "git *"` does **not** auto-allow; it degrades to `ask` because OpenCode's shell parsing is not reimplemented here.
+  - `deny` / `ask` rules still apply.
+- In `permission: "ask"`, a request with no explicit user rule is `ask` even when an OpenCode built-in agent (for example `explore`) has an allow rule. In headless/CI (`opencode run`, no unattended allow) it is denied. The TUI's saved "Always allow" rules are not visible to the plugin, so they do not bypass this default; the plugin does not pass `save`.
+- OpenCode 2.3.2 is the supported version for canonical auto-allow. On an unknown version the plugin still shows informative prompts, but canonical rules stop auto-allowing; legacy `antigravity.*` rules remain the fallback. This fails closed rather than guessing built-in rule layouts.
+- Antigravity may auto-approve a tool without sending `session/request_permission` (observed with some `/tmp` writes and `search_web`). The plugin can only gate requests Antigravity actually sends. Do not treat `permission: "ask"` as a sandbox.
 - `permission: "allow"` selects an allow option for every request; `"deny"` selects a reject option. Use these deliberately.
 - `mode: "auto"` / `"accept-edits"` can make Antigravity stop sending permission requests; OpenCode cannot gate a request the agent never makes. Default mode is `default`. Do not combine `mode: "auto"` with `permission: "ask"` if you expect every native tool action to be reviewed.
 - Antigravity-native tools execute inside the `agy` process with your OS privileges. OpenCode's permission gate is a UX/approval layer, not a sandbox. Use `agy`'s own permission settings and `--sandbox` if you need isolation.
@@ -186,7 +209,7 @@ Environment:
 bun install
 bun run typecheck
 bun run test          # runs test/ only; the repo contains other tests under ref/
-bun run test:integration  # end-to-end with a mock ACP agent, no quota
+bun run test:integration  # mock ACP + real OpenCode permission hook, no quota
 bun run build         # optional dist/ output
 ```
 

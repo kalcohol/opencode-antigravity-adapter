@@ -17,7 +17,7 @@
     "test": "cd test && bun test",
     "build": "tsc -p tsconfig.build.json",
     "pack": "npm pack --dry-run",
-    "test:integration": "bash scripts/integration-mock.sh"
+    "test:integration": "bash scripts/integration-mock.sh && bash scripts/integration-permission.sh"
   },
   "keywords": [
     "opencode",
