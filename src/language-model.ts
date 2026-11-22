@@ -195,7 +195,9 @@ class Renderer {
           providerExecuted: true,
         })
       } else {
-        if (call.name) tool.name = call.name
+        // The name is immutable once the tool-call was emitted: a later
+        // update may supply the real name after a title-only initial call,
+        // but OpenCode requires result names to match the call.
         if (call.title) tool.title = call.title
         if (call.rawInput !== undefined) tool.input = call.rawInput
         if (call.content !== undefined) tool.content = call.content

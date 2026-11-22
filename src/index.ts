@@ -21,10 +21,20 @@ const CONTEXT_LIMIT = 1_048_576
 const OUTPUT_LIMIT = 65_536
 
 /** Stable per-location pointer so cached AISDK models follow a plugin reload. */
-class ManagerRef {
+interface ManagerRef {
   current?: SessionManager
 }
-const managerRefs = new Map<string, ManagerRef>()
+// `globalThis` keeps the registry alive across plugin module re-evaluation.
+// Without this, a cached AISDK language model from the old module instance
+// would look at the old module's Map and could never see the new manager.
+const MANAGER_REFS = Symbol.for("opencode.antigravity.managerRefs")
+const managerRefs: Map<string, ManagerRef> =
+  ((globalThis as Record<symbol, unknown>)[MANAGER_REFS] as Map<string, ManagerRef> | undefined) ??
+  (() => {
+    const map = new Map<string, ManagerRef>()
+    ;(globalThis as Record<symbol, unknown>)[MANAGER_REFS] = map
+    return map
+  })()
 
 interface Options {
   readonly directory: string
@@ -211,7 +221,7 @@ export default Plugin.define({
 
       const options = normalizeOptions(ctx)
       const manager = new SessionManager(ctx, options)
-      const ref = managerRefs.get(options.directory) ?? new ManagerRef()
+      const ref = managerRefs.get(options.directory) ?? {}
       managerRefs.set(options.directory, ref)
       ref.current = manager
       const currentManager = () => {

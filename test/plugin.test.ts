@@ -245,6 +245,38 @@ describe("stream mapping", () => {
     expect(result.toolName).toBe("read_file")
   })
 
+  test("keeps a title-only initial tool name immutable after a named update", async () => {
+    const run = async (
+      _sessionID: string,
+      _request: unknown,
+      onUpdate: (update: AcpSessionUpdate) => void,
+    ): Promise<AcpPromptResult> => {
+      onUpdate({
+        sessionUpdate: "tool_call",
+        toolCallId: "call-title",
+        title: "Read file",
+        status: "pending",
+      })
+      onUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "call-title",
+        name: "read_file",
+        status: "completed",
+      } as any)
+      return { stopReason: "end_turn" }
+    }
+    const model = new AntigravityLanguageModel("gemini-3.8-flash", { run })
+    const { stream } = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "go" }] }],
+      headers: { "x-opencode-session-id": "s-1" },
+    } as any)
+    const parts = await collect(stream)
+    const call = parts.find((part) => part.type === "tool-call")
+    const result = parts.find((part) => part.type === "tool-result")
+    expect(call.toolName).toBe("Read file")
+    expect(result.toolName).toBe("Read file")
+  })
+
   test("preserves late tool rawInput and rawOutput", async () => {
     const run = async (
       _sessionID: string,
