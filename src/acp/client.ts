@@ -39,6 +39,33 @@ function isExecutableFile(filePath: string): boolean {
   }
 }
 
+/** Fallback locations when `agy` is not on the service process PATH. */
+export function agyFallbackPaths(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  home: string | undefined,
+): string[] {
+  if (platform === "win32") {
+    const join = path.win32.join
+    return [
+      ...(env.LOCALAPPDATA
+        ? [
+            join(env.LOCALAPPDATA, "agy", "bin", "agy.exe"),
+            join(env.LOCALAPPDATA, "Programs", "Antigravity", "bin", "agy.exe"),
+          ]
+        : []),
+      ...(home ? [join(home, ".local", "bin", "agy.exe")] : []),
+    ]
+  }
+  return [
+    ...(home ? [path.join(home, ".local", "bin", "agy"), path.join(home, "bin", "agy")] : []),
+    "/opt/homebrew/bin/agy",
+    "/usr/local/bin/agy",
+    "/opt/Antigravity/bin/agy",
+    "/usr/bin/agy",
+  ]
+}
+
 export function resolveAgyBinary(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.AGY_BIN?.trim()
   if (override) return override
@@ -53,25 +80,7 @@ export function resolveAgyBinary(env: NodeJS.ProcessEnv = process.env): string {
   }
 
   const home = env.HOME || env.USERPROFILE || os.homedir()
-  const fallbackPaths =
-    process.platform === "win32"
-      ? [
-          ...(env.LOCALAPPDATA
-            ? [path.join(env.LOCALAPPDATA, "Programs", "Antigravity", "bin", "agy.exe")]
-            : []),
-          ...(home ? [path.join(home, ".local", "bin", "agy.exe")] : []),
-        ]
-      : [
-          ...(home
-            ? [path.join(home, ".local", "bin", "agy"), path.join(home, "bin", "agy")]
-            : []),
-          "/opt/homebrew/bin/agy",
-          "/usr/local/bin/agy",
-          "/opt/Antigravity/bin/agy",
-          "/usr/bin/agy",
-        ]
-
-  for (const candidate of fallbackPaths) {
+  for (const candidate of agyFallbackPaths(process.platform, env, home)) {
     if (isExecutableFile(candidate)) return candidate
   }
 
