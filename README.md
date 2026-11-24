@@ -36,8 +36,8 @@ This is an engineering reading of the public sources, not legal advice.
 
 ## Requirements
 
-- OpenCode `2.3.2` for canonical permission rules; older/newer versions still
-  display prompts but fail closed for canonical auto-allow.
+- OpenCode `2.3.2` (V2 plugin API; `@opencode/plugin` 2.3.2). Canonical
+  auto-allow is pinned to 2.3.2; unknown versions fail closed.
 - `agy` with ACP support. Tested with ACP server `1.5.13` and `1.5.14`.
 - `agy` signed in, or an API-key/enterprise auth method configured.
 - Linux, macOS, or Windows. On Windows the plugin also probes
